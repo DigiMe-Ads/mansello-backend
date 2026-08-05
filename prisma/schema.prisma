@@ -1,0 +1,321 @@
+// Mansello backend — Prisma schema
+// NOTE: the Postgres exclusion constraint that guarantees no two active
+// bookings/blocks can overlap for the same property CANNOT be expressed here.
+// It is added by a raw-SQL migration — see prisma/migrations_manual/001_exclusion_constraint.sql
+// and SUPABASE_SETUP.md for the exact statement to run.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum StripeAccountRef {
+  italy
+  sri_lanka
+}
+
+enum AvailabilitySource {
+  direct
+  airbnb
+  manual
+}
+
+enum BlockStatus {
+  active
+  cancelled
+}
+
+enum BookingStatus {
+  pending_payment
+  confirmed
+  paid_offline
+  cancelled
+  completed
+}
+
+enum TransportType {
+  fixed_price
+  custom_quote
+}
+
+enum LeadStatus {
+  new
+  read
+  responded
+}
+
+enum OrderStatus {
+  pending
+  confirmed
+  packed
+  shipped
+  delivered
+  cancelled
+  returned
+}
+
+enum ContactSubject {
+  room_booking
+  airport_transfer
+  marketplace
+  other
+}
+
+enum Site {
+  italy
+  sri_lanka
+}
+
+enum AdminRole {
+  super_admin
+  villa_manager
+  marketplace_manager
+}
+
+model Property {
+  id                  String   @id @default(uuid())
+  slug                String   @unique // "the-nest-bologna" | "donas-villa"
+  name                String
+  country             String
+  currency            String   @default("usd")
+  timezone            String // IANA, e.g. Europe/Rome / Asia/Colombo
+  checkInTime         String // "15:00"
+  checkOutTime        String // "11:00"
+  minNights           Int      @default(1)
+  turnoverBufferDays  Int      @default(0)
+  maxGuests           Int
+  address             String
+  stripeAccountRef    StripeAccountRef
+  airbnbIcalImportUrls String[] @default([]) // Airbnb "Export Calendar" URLs we poll — a property
+  // can be double/triple-listed on Airbnb (e.g. whole villa + individual rooms sold
+  // separately), each with its own feed; all of them feed into this one property's
+  // shared AvailabilityBlock pool. Booking.com feeds go in here too once obtained.
+  icalExportToken     String   @unique @default(uuid()) // used to build our own export feed URL
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  pricingTiers       PricingTier[]
+  availabilityBlocks AvailabilityBlock[]
+  bookings           Booking[]
+  transportRequests  TransportRequest[]
+  adminUsers         AdminUser[]
+  offers             Offer[]
+}
+
+model PricingTier {
+  id             String   @id @default(uuid())
+  propertyId     String
+  property       Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  guestCount     Int
+  rooms          Int      @default(1) // how many rooms this tier's price covers — always 1 for
+  // single-unit properties (e.g. The Nest Bologna); Dona's Villa offers the same party
+  // size at more than one room count (e.g. 2 guests in 1 room vs. 2 guests in 2 rooms)
+  // at different prices, so guestCount alone isn't a unique key.
+  pricePerNight  Decimal  @db.Decimal(10, 2)
+
+  @@unique([propertyId, guestCount, rooms])
+}
+
+// Unified date-range table. Every active booking (direct or Airbnb-imported)
+// has exactly one row here. The exclusion constraint lives on this table.
+model AvailabilityBlock {
+  id           String             @id @default(uuid())
+  propertyId   String
+  property     Property           @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  startDate    DateTime           @db.Date
+  endDate      DateTime           @db.Date
+  source       AvailabilitySource
+  status       BlockStatus        @default(active)
+  externalUid  String? // Airbnb UID, used to dedupe on re-sync
+  bookingId    String?            @unique
+  booking      Booking?           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@index([propertyId, status])
+  @@index([externalUid])
+}
+
+model Booking {
+  id                     String        @id @default(uuid())
+  propertyId             String
+  property               Property      @relation(fields: [propertyId], references: [id])
+  guestName              String
+  guestEmail             String
+  guestPhone             String
+  guestIdDocumentType    String?
+  guestIdDocumentNumber  String?
+  checkIn                DateTime      @db.Date
+  checkOut               DateTime      @db.Date
+  guests                 Int
+  rooms                  Int           @default(1) // which PricingTier (guestCount, rooms) priced this stay
+  totalPrice             Decimal       @db.Decimal(10, 2)
+  currency               String        @default("usd")
+  stripePaymentIntentId  String?
+  status                 BookingStatus @default(pending_payment)
+  expiresAt              DateTime? // pending_payment hold expiry
+  cancelledAt            DateTime?
+  refundAmount           Decimal?      @db.Decimal(10, 2)
+  refundReason           String?
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+
+  availabilityBlock AvailabilityBlock?
+  transportRequests TransportRequest[]
+
+  @@index([propertyId, status])
+}
+
+model TransportRequest {
+  id            String         @id @default(uuid())
+  propertyId    String?
+  property      Property?      @relation(fields: [propertyId], references: [id])
+  bookingId     String? // set when submitted as a booking add-on; null for standalone Transport page requests
+  booking       Booking?       @relation(fields: [bookingId], references: [id])
+  type          TransportType
+  date          DateTime
+  flightNumber  String?
+  passengers    Int            @default(1)
+  contactName   String
+  contactEmail  String
+  contactPhone  String
+  notes         String?
+  status        LeadStatus     @default(new)
+  createdAt     DateTime       @default(now())
+}
+
+model Category {
+  id        String    @id @default(uuid())
+  name      String
+  slug      String    @unique
+  products  Product[]
+}
+
+model Product {
+  id           String      @id @default(uuid())
+  categoryId   String
+  category     Category    @relation(fields: [categoryId], references: [id])
+  name         String
+  description  String
+  priceUsd     Decimal     @db.Decimal(10, 2)
+  images       String[]
+  sku          String      @unique
+  active       Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  stockLevel  StockLevel?
+  orderItems  OrderItem[]
+}
+
+model StockLevel {
+  id                String   @id @default(uuid())
+  productId         String   @unique
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantityOnHand    Int      @default(0)
+  lowStockThreshold Int      @default(5)
+  updatedAt         DateTime @updatedAt
+}
+
+model Order {
+  id               String      @id @default(uuid())
+  customerName     String
+  customerPhone    String
+  deliveryAddress  String
+  notes            String?
+  status           OrderStatus @default(pending)
+  paymentMethod    String      @default("cod")
+  shippingFee      Decimal     @db.Decimal(10, 2)
+  subtotal         Decimal     @db.Decimal(10, 2)
+  total            Decimal     @db.Decimal(10, 2)
+  flaggedForReview Boolean     @default(false)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  items OrderItem[]
+
+  @@index([customerPhone])
+  @@index([status])
+}
+
+model OrderItem {
+  id                   String  @id @default(uuid())
+  orderId              String
+  order                Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId            String
+  product              Product @relation(fields: [productId], references: [id])
+  productNameSnapshot  String
+  unitPriceSnapshot    Decimal @db.Decimal(10, 2)
+  quantity             Int
+  lineTotal            Decimal @db.Decimal(10, 2)
+}
+
+model ContactMessage {
+  id        String         @id @default(uuid())
+  site      Site
+  name      String
+  email     String
+  subject   ContactSubject
+  message   String
+  status    LeadStatus     @default(new)
+  createdAt DateTime       @default(now())
+}
+
+model NewsletterSubscriber {
+  id            String   @id @default(uuid())
+  email         String
+  site          Site
+  subscribedAt  DateTime @default(now())
+
+  @@unique([email, site])
+}
+
+// At most one active offer per property is enforced at the application
+// layer (see modules/offers/service.ts) rather than a DB constraint — same
+// class of soft business rule as turnoverBufferDays, low-stakes enough not
+// to need one.
+model Offer {
+  id               String   @id @default(uuid())
+  propertyId       String
+  property         Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  title            String
+  discountPercent  Int
+  imageUrl         String?
+  active           Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([propertyId])
+}
+
+model BlogPost {
+  id             String    @id @default(uuid())
+  site           Site
+  slug           String    @unique
+  title          String
+  excerpt        String
+  body           String
+  coverImageUrl  String?
+  author         String
+  publishedAt    DateTime? // null = draft, not publicly visible
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([site, publishedAt])
+}
+
+model AdminUser {
+  id             String    @id @default(uuid())
+  email          String    @unique
+  passwordHash   String
+  role           AdminRole
+  propertyScopeId String?
+  propertyScope  Property? @relation(fields: [propertyScopeId], references: [id])
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
