@@ -17,6 +17,11 @@ import adminAuthRoutes from "@/modules/admin/routes";
 import offersRoutes from "@/modules/offers/routes";
 import blogRoutes from "@/modules/blog/routes";
 import uploadsRoutes from "@/modules/uploads/routes";
+import {
+  templateRoutes as guestInfoTemplateRoutes,
+  bookingRoutes as bookingInfoRequestRoutes,
+  publicRoutes as bookingInfoPublicRoutes,
+} from "@/modules/guestInfo/routes";
 
 export function createApp() {
   const app = express();
@@ -39,13 +44,18 @@ export function createApp() {
   app.use("/api/properties", propertiesRoutes);
   app.use("/api/availability", availabilityRoutes);
   app.use("/api/bookings", bookingsRoutes);
+  // Adds /:id/info-requests on top of the routes above — a separate router
+  // (see modules/guestInfo/routes.ts) so that module stays self-contained.
+  app.use("/api/bookings", bookingInfoRequestRoutes);
   app.use("/api/marketplace/catalog", catalogRoutes);
   app.use("/api/marketplace/orders", ordersRoutes);
   app.use("/api/leads", leadsRoutes);
   app.use("/api/admin", adminAuthRoutes);
+  app.use("/api/admin/guest-info-template", guestInfoTemplateRoutes);
   app.use("/api/offers", offersRoutes);
   app.use("/api/blog", blogRoutes);
   app.use("/api/uploads", uploadsRoutes);
+  app.use("/api/booking-info-requests", bookingInfoPublicRoutes);
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);

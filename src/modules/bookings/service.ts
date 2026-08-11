@@ -16,6 +16,43 @@ function isExclusionViolation(err: unknown): boolean {
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
+// Property.cityTaxBands shape — the Bologna municipal tourist tax (imposta
+// di soggiorno), banded by the room's underlying price per person per
+// night (not what any one guest is actually charged, which can differ once
+// discounts etc. exist). `maxPricePerPersonPerNight: null` marks the top,
+// unbounded band.
+export interface CityTaxBand {
+  minPricePerPersonPerNight: number;
+  maxPricePerPersonPerNight: number | null;
+  ratePerPersonPerNight: number;
+}
+
+// Guests under cityTaxExemptAgeUnder pay nothing; a stay longer than
+// cityTaxMaxNights only accrues tax for the first cityTaxMaxNights nights —
+// the room price itself is unaffected by that cap, only the tax stops.
+function computeCityTax(
+  property: { cityTaxEnabled: boolean; cityTaxMaxNights: number; cityTaxExemptAgeUnder: number; cityTaxBands: unknown },
+  pricePerNight: number,
+  nights: number,
+  guests: number,
+  childrenUnder14: number
+): number {
+  if (!property.cityTaxEnabled) return 0;
+
+  const taxableGuests = Math.max(0, guests - Math.min(childrenUnder14, guests));
+  const taxedNights = Math.min(nights, property.cityTaxMaxNights);
+  const pricePerPersonPerNight = pricePerNight / guests;
+
+  const bands = property.cityTaxBands as CityTaxBand[];
+  const band = bands.find(
+    (b) =>
+      pricePerPersonPerNight >= b.minPricePerPersonPerNight &&
+      (b.maxPricePerPersonPerNight === null || pricePerPersonPerNight <= b.maxPricePerPersonPerNight)
+  );
+
+  return band ? taxableGuests * taxedNights * band.ratePerPersonPerNight : 0;
+}
+
 // The price a guest pays is never taken from the request — it's always looked
 // up from the property's own PricingTier table (guestCount x rooms), same as
 // how marketplace orders snapshot productPrice from the DB rather than trust
@@ -26,7 +63,8 @@ export async function computeBookingPrice(
   checkIn: Date,
   checkOut: Date,
   guests: number,
-  rooms: number
+  rooms: number,
+  childrenUnder14 = 0
 ) {
   const property = await prisma.property.findUnique({ where: { id: propertyId } });
   if (!property) throw ApiError.notFound("Property not found");
@@ -71,11 +109,17 @@ export async function computeBookingPrice(
     throw ApiError.badRequest(`No price is configured for ${guests} guest(s) in ${rooms} room(s) at this property`);
   }
 
+  const pricePerNight = Number(tier.pricePerNight);
+  const accommodationPrice = pricePerNight * nights;
+  const cityTax = computeCityTax(property, pricePerNight, nights, guests, childrenUnder14);
+
   return {
     property,
     nights,
-    pricePerNight: Number(tier.pricePerNight),
-    totalPrice: Number(tier.pricePerNight) * nights,
+    pricePerNight,
+    accommodationPrice,
+    cityTax,
+    totalPrice: accommodationPrice + cityTax, // <- what actually gets charged
     currency: property.currency,
   };
 }
@@ -91,6 +135,7 @@ export interface CreatePendingBookingInput {
   checkOut: Date;
   guests: number;
   rooms: number;
+  childrenUnder14?: number;
 }
 
 // The exclusion constraint (see SUPABASE_SETUP.md) is what actually prevents
@@ -103,7 +148,8 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
     input.checkIn,
     input.checkOut,
     input.guests,
-    input.rooms
+    input.rooms,
+    input.childrenUnder14
   );
   const expiresAt = new Date(Date.now() + env.bookingHoldMinutes * 60_000);
 
@@ -121,6 +167,9 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
           checkOut: input.checkOut,
           guests: input.guests,
           rooms: input.rooms,
+          accommodationPrice: priced.accommodationPrice,
+          cityTax: priced.cityTax,
+          childrenUnder14: input.childrenUnder14 ?? 0,
           totalPrice: priced.totalPrice,
           currency: priced.currency,
           status: "pending_payment",
@@ -163,9 +212,23 @@ export async function createOfflineBooking(
     input.checkIn,
     input.checkOut,
     input.guests,
-    input.rooms
+    input.rooms,
+    input.childrenUnder14
   );
+
+  // totalPriceOverride has always meant "this exact figure is what gets
+  // charged" — preserved here rather than adding cityTax on top of it (which
+  // would silently charge more than the number an admin typed in). City tax
+  // is still computed from the standard tier rate per the comune's rule
+  // (banded on the underlying price, not the actual charge — see
+  // BACKEND_CHANGES_CITY_TAX.md), and backed out of the override so
+  // accommodationPrice + cityTax still equals totalPrice; clamped at 0 for
+  // the pathological case of an override smaller than the tax alone.
   const totalPrice = input.totalPriceOverride ?? priced.totalPrice;
+  const cityTax = priced.cityTax;
+  const accommodationPrice = input.totalPriceOverride === undefined
+    ? priced.accommodationPrice
+    : Math.max(0, totalPrice - cityTax);
 
   try {
     return await prisma.$transaction(async (tx) => {
@@ -181,6 +244,9 @@ export async function createOfflineBooking(
           checkOut: input.checkOut,
           guests: input.guests,
           rooms: input.rooms,
+          accommodationPrice,
+          cityTax,
+          childrenUnder14: input.childrenUnder14 ?? 0,
           totalPrice,
           currency: priced.currency,
           status: "paid_offline",
@@ -270,6 +336,11 @@ export async function expireStalePendingBookings() {
 }
 
 // Default policy from BACKEND_PLAN.md §9, overridable per property later.
+// Deliberate decision (BACKEND_CHANGES_CITY_TAX.md §4): this runs off
+// totalPrice, which now includes cityTax, so a full/partial refund refunds
+// the tax portion too rather than carving it out. Treated as correct rather
+// than an accidental side effect — the guest never stayed, so the tax was
+// never actually owed to the comune either.
 export function computeRefundAmount(totalPrice: number, checkIn: Date, now = new Date()) {
   const msPerDay = 24 * 60 * 60 * 1000;
   const daysUntilCheckIn = (checkIn.getTime() - now.getTime()) / msPerDay;

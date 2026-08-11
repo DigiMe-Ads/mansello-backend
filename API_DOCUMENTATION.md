@@ -91,6 +91,17 @@ number with 3+ `cancelled`/`returned` orders gets new orders auto-flagged
 | PUT | `/api/properties/:propertyId/pricing-tiers` | super_admin, villa_manager (own property) | Body: `{ "tiers": [{ "guestCount": 2, "rooms": 1, "pricePerNight": 120 }, ...] }`. `rooms` defaults to 1 if omitted — only Dona's Villa needs more than one tier per `guestCount`. Upserts only — doesn't remove tiers missing from the array |
 | DELETE | `/api/properties/:propertyId/pricing-tiers/:tierId` | super_admin, villa_manager (own property) | Remove a single pricing tier. `404` if it doesn't exist or belongs to a different property |
 
+Every `Property` returned by the endpoints above also carries Bologna's
+municipal tourist tax (*imposta di soggiorno*) config: `cityTaxEnabled`
+(bool, `true` only for The Nest Bologna — Sri Lanka has no equivalent),
+`cityTaxMaxNights` (default `5` — nights beyond this aren't taxed, the room
+price still is), `cityTaxExemptAgeUnder` (default `14`), and `cityTaxBands`
+(`{ minPricePerPersonPerNight, maxPricePerPersonPerNight: number | null,
+ratePerPersonPerNight }[]`, sorted ascending, `null` max = the top band).
+Set via `prisma/seed.ts`, not through `PATCH /api/properties/:propertyId` —
+there's no admin UI for editing these yet. See §4 for how they turn into an
+actual charge on a booking.
+
 ## 3. Availability — `/api/availability`
 
 | Method | Path | Auth | Description |
@@ -104,14 +115,29 @@ number with 3+ `cancelled`/`returned` orders gets new orders auto-flagged
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms? }` (`rooms` defaults to 1 — only Dona's Villa has more than one option). Price is computed server-side from the property's `PricingTier` table, never taken from the request; `400` if no tier is configured for that guest/room combo. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates just got taken |
+| POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms?, childrenUnder14? }` (`rooms` defaults to 1 — only Dona's Villa has more than one option; `childrenUnder14` defaults to 0, and `400`s if it exceeds `guests`). Price is computed server-side from the property's `PricingTier` table, never taken from the request; `400` if no tier is configured for that guest/room combo. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates just got taken |
 | GET | `/api/bookings/:id` | public | Booking status (poll after Stripe confirmation, or for a "my booking" page) |
 | GET | `/api/bookings/property/:propertyId?status=` | super_admin, villa_manager (own property) | List bookings, optional status filter |
-| POST | `/api/bookings/offline` | super_admin, villa_manager (own property) | Manual/phone/walk-in booking — same body as above, no Stripe. Created as `paid_offline`. Optional `totalPriceOverride` for a negotiated rate; otherwise priced the same way as a direct booking |
-| POST | `/api/bookings/:id/cancel` | super_admin, villa_manager | Body: `{ refundOverride?, reason? }`. Refund defaults to the standard policy (100% ≥7 days out, 50% 3–7 days, 0% <72h); triggers a real Stripe refund on the correct account unless `refundOverride` is given |
+| POST | `/api/bookings/offline` | super_admin, villa_manager (own property) | Manual/phone/walk-in booking — same body as above, no Stripe. Created as `paid_offline`. Optional `totalPriceOverride` for a negotiated rate (this overrides `accommodationPrice` only — city tax, when the property has it, is still computed from the standard tier rate and added on top, since it's a pass-through municipal fee, not part of the negotiated room price); otherwise priced the same way as a direct booking |
+| POST | `/api/bookings/:id/cancel` | super_admin, villa_manager | Body: `{ refundOverride?, reason? }`. Refund defaults to the standard policy (100% ≥7 days out, 50% 3–7 days, 0% <72h) computed off `totalPrice` — which includes city tax, so a full/partial refund refunds the tax portion too (the guest never stayed, so it was never owed to the comune either); triggers a real Stripe refund on the correct account unless `refundOverride` is given |
 
 `booking.status`: `pending_payment` → `confirmed` (via webhook) or `cancelled`
 (expired hold) — or `paid_offline` for manual admin bookings.
+
+**Price breakdown, for properties with `cityTaxEnabled`** (currently just
+The Nest Bologna): every `Booking` carries `accommodationPrice` (pure room
+cost — `pricePerNight × nights`), `cityTax` (computed from the property's
+`cityTaxBands`, `0` when the property doesn't have city tax), and
+`childrenUnder14` (as submitted, recorded for audit — the exemption math is
+already baked into `cityTax` by the time it's stored). `totalPrice =
+accommodationPrice + cityTax` is the amount actually charged via Stripe (or
+recorded for an offline booking) — for a `cityTaxEnabled: false` property,
+`accommodationPrice` and `totalPrice` are simply equal. Tax is per guest per
+night, banded by the room's price *per person per night* (the underlying
+rate, not whatever any one guest ends up charged), guests under
+`cityTaxExemptAgeUnder` are exempt entirely, and nights beyond
+`cityTaxMaxNights` stop accruing tax (the room price for those nights is
+still charged in full).
 
 ## 5. Payments (webhooks only — no public endpoints)
 
@@ -131,7 +157,7 @@ Register both endpoints in each Stripe dashboard, subscribed to at least
 | POST | `/api/marketplace/catalog/categories` | super_admin, marketplace_manager | Body: `{ name, slug? }` — `slug` is derived from `name` if omitted. `409` if the slug already exists |
 | GET | `/api/marketplace/catalog/products?category=slug` | public | Active products, optional category filter |
 | GET | `/api/marketplace/catalog/products/:id` | public | Single product |
-| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §12.9, new code should use that instead |
+| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §13.9, new code should use that instead |
 | POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold? }` |
 | PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `name`, `description`, `priceUsd`, `images`, `active` |
 | POST | `/api/marketplace/catalog/products/:id/stock-adjustment` | super_admin, marketplace_manager | Body: `{ delta }` (positive = restock, negative = manual removal) |
@@ -202,13 +228,49 @@ are, so this is deliberately not role-split further for now.
 | GET | `/api/admin/dashboard` | any admin | Upcoming check-ins/outs (next 7 days), revenue per property, low-stock count, pending-orders count |
 | POST | `/api/admin/users` | super_admin | Create an admin account. Body: `{ email, password, role, propertyScopeId? }` — there is no public signup route |
 
+## 12. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
+
+Lets an admin send a booked guest a link, by email, to a short form
+collecting whatever extra info is needed before their stay (passport number,
+arrival flight, dietary requirements, etc.) — no guest login/account system.
+Full design in `BACKEND_CHANGES_GUEST_INFO_REQUESTS.md`.
+
+**Flow:** admin edits a shared question list once (the template) → clicks
+"Request Guest Info" on a booking, which snapshots the *current* template
+into a new `BookingInfoRequest` row, generates a `token`, and emails the
+guest a link (`{FRONTEND_URL}/booking-info/{token}`) → guest opens the link,
+no login, fills the form, submits once (no edit-after-submit — a correction
+means the admin sends a fresh link, which creates a new row/token) → admin
+sees the answers back on the booking. Editing the template later never
+changes a link already sent, since each request carries its own frozen copy
+of the fields it was sent with. Manual trigger only — no scheduled job.
+
+A `BookingInfoRequest.status` of `pending` reads as `expired` once
+`expiresAt` (14 days after creation) has passed — computed on every read,
+not by a background job, so nothing needs to run for it to be accurate.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/admin/guest-info-template` | super_admin | Returns `{ fields, updatedAt }`, the shared question list. `{ fields: [], updatedAt: null }` if never set — not a `404` |
+| PUT | `/api/admin/guest-info-template` | super_admin | Body: `{ fields }` — upserts the single shared row. `fields` is `{ id, label, type: "text"\|"textarea"\|"date"\|"number"\|"select"\|"checkbox"\|"file", required, options? }[]`; `id` is client-generated and stable per field (it's the key answers get stored under). `"file"` collects a document — see the uploads endpoint below |
+| POST | `/api/bookings/:id/info-requests` | super_admin, villa_manager (own property) | Creates a `BookingInfoRequest`: snapshots the current template's `fields`, generates a `token`, sets a 14-day `expiresAt`, and emails the guest. Returns the created row **including `token`/`link`** — the admin UI's "Copy Link" button uses it as a manual fallback (WhatsApp etc.) if the email doesn't land. `404` if the booking doesn't exist; `403` if a villa_manager doesn't own its property |
+| GET | `/api/bookings/:id/info-requests` | super_admin, villa_manager (own property) | Lists all requests for this booking, most recent first (more than one if the admin re-sent). Same scoping as `POST` |
+| GET | `/api/booking-info-requests/:token` | public | Everything the guest-facing form needs in one call: `{ status, propertyName, guestName, checkIn, checkOut, fields, expiresAt }`. `404` if the token doesn't exist at all; a lapsed-but-real token still returns `200` with `status: "expired"` (a friendly message, not a hard error) — the token/link itself is never echoed back here, there's nothing to expose |
+| POST | `/api/booking-info-requests/:token/uploads` | public | Multipart body, files under a repeatable `files` field. Uploads immediately as the guest picks a file, before submit (same UX as the admin product-image dropzone) — not bundled as raw bytes into the `submit` payload below. Returns `{ urls: string[] }`; feed those into the matching `"file"` field's answer. JPEG/PNG/WebP/PDF only, 10MB/file, enforced server-side regardless of the frontend's `accept` attribute. Same status gating as `submit`: `404` unknown token, `409` if already submitted, `410` if expired |
+| POST | `/api/booking-info-requests/:token/submit` | public | Body: `{ answers: { [fieldId]: string \| boolean \| string[] } }` — a `"file"` field's answer is the `urls` array from the uploads endpoint above. Every `required` field (per the row's own snapshotted `fields`) must have a non-empty answer (a non-empty array counts, for `"file"`), else `400`. On success: stores `answers`, sets `status: "submitted"`. `404` unknown token, `409` if already submitted, `410` if expired |
+
+No customer accounts, no sessions — knowing the token *is* the access
+control, same trust model as `Property.icalExportToken` elsewhere in this
+API. Uploaded documents go to the same S3/R2 bucket as `/api/uploads/images`
+(§13.9), under a `guest-documents/` prefix.
+
 ---
 
-## 12. Frontend integration checklist
+## 13. Frontend integration checklist
 
 Things a frontend needs to know that aren't obvious from the endpoint list above.
 
-### 12.1 Stripe publishable keys — not provided by this API
+### 13.1 Stripe publishable keys — not provided by this API
 
 This backend only ever holds Stripe **secret** keys, server-side
 (`STRIPE_ITALY_SECRET_KEY` / `STRIPE_SRILANKA_SECRET_KEY`). To initialize
@@ -223,7 +285,7 @@ publishable/secret key pair (frontend using the wrong account's key) fails
 with a "No such payment_intent" error client-side — the two keys must come
 from the *same* Stripe account.
 
-### 12.2 Confirming payment — use the Payment Element, and pass a `return_url`
+### 13.2 Confirming payment — use the Payment Element, and pass a `return_url`
 
 PaymentIntents are created with `automatic_payment_methods: { enabled: true }`
 (default `allow_redirects: "always"`), so each one's `payment_method_types`
@@ -238,7 +300,7 @@ Dashboard (restrict enabled payment methods) or ask for a backend change to
 set `allow_redirects: "never"` in `payments/service.ts` — not something to
 work around purely in the frontend.
 
-### 12.3 Booking confirmation is asynchronous — poll after `confirmPayment`
+### 13.3 Booking confirmation is asynchronous — poll after `confirmPayment`
 
 `stripe.confirmPayment()` resolving successfully in the browser does **not**
 mean `booking.status` is `confirmed` yet — that only happens once Stripe's
@@ -249,7 +311,7 @@ poll `GET /api/bookings/:id` (e.g. every 1–2s, give up after ~15s) until
 timeout there most likely means the webhook is just running slightly behind,
 not that anything failed — word the UI accordingly rather than showing an error.
 
-### 12.4 The hold has a countdown — show it, and handle expiry gracefully
+### 13.4 The hold has a countdown — show it, and handle expiry gracefully
 
 `POST /api/bookings` returns `booking.expiresAt` (15 minutes out by default,
 `BOOKING_HOLD_MINUTES`). If checkout isn't completed by then, a cron job
@@ -259,7 +321,7 @@ the next poll). Show a visible countdown during checkout, and if payment
 fails after the hold appears to have expired, message it as "your hold
 expired, please start again" rather than a generic payment error.
 
-### 12.5 Room selection only exists for Dona's Villa
+### 13.5 Room selection only exists for Dona's Villa
 
 `guests` + `rooms` (optional in the request, defaults to `1`) together select
 the exact `PricingTier` row. Fetch `GET /api/properties/:slug` and use its
@@ -273,21 +335,21 @@ price yourself — the server always derives `totalPrice` from whichever
 that combination (show that message directly; it means the UI offered an
 invalid guest/room combo).
 
-### 12.6 Currency is per-property
+### 13.6 Currency is per-property
 
 `property.currency` is `"eur"` for The Nest Bologna and `"usd"` for Dona's
 Villa — format guest-facing prices accordingly (`€` vs `$`), don't hardcode
 one currency site-wide. `Booking.currency` in every booking response always
 matches `property.currency`.
 
-### 12.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
+### 13.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
 
 `checkIn`/`checkOut` are stored as dates only, no time component. Sending a
 full ISO datetime risks the calendar date shifting by a day once converted to
 UTC (e.g. a late-evening Sri Lanka timestamp rolling into the next UTC day).
 Always send plain date strings, e.g. `"2026-08-01"`.
 
-### 12.8 CORS
+### 13.8 CORS
 
 `CORS_ORIGIN` in the backend's `.env` must exactly match the frontend's
 origin (`src/app.ts` → `cors({ origin: env.corsOrigin })`, currently only a
@@ -295,7 +357,7 @@ single origin string, no allowlist). Defaults to `http://localhost:3000` for
 local dev — update it before deploying if the production frontend domain
 differs.
 
-### 12.9 Image upload
+### 13.9 Image upload
 
 `POST /api/uploads/images` is the one shared upload endpoint — used by the
 product catalog, offers, and blog alike. It proxies the upload through this
@@ -341,7 +403,7 @@ feature-specific upload routes going forward.
 
 ---
 
-## 13. Error shape
+## 14. Error shape
 
 ```json
 { "error": "date_conflict", "message": "These dates are no longer available for this property." }
@@ -352,7 +414,7 @@ Validation errors (Zod) return `400` with
 — `path` is dot-joined, prefixed with `body`/`query`/`params` per where the
 field lives in the request.
 
-## 14. Not yet wired (see BACKEND_PLAN.md for context)
+## 15. Not yet wired (see BACKEND_PLAN.md for context)
 
 - WhatsApp transfer confirmations (currently a manual admin action, per plan §11)
 - Government ID-export endpoint for Italy/Sri Lanka compliance filing (data is captured on `Booking`, export route not yet built)

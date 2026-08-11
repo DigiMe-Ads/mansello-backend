@@ -10,6 +10,11 @@ export const env = {
   port: Number(process.env.PORT ?? 4000),
   nodeEnv: process.env.NODE_ENV ?? "development",
   corsOrigin: process.env.CORS_ORIGIN ?? "http://localhost:3000",
+  // Used to build guest-facing links we email out (e.g. the booking-info
+  // form) — same origin the frontend is served from, so no reason for this
+  // to differ from CORS_ORIGIN in practice, but kept as its own var since
+  // conflating "who's allowed to call us" with "where guests land" is fragile.
+  frontendUrl: process.env.FRONTEND_URL ?? "http://localhost:3000",
 
   databaseUrl: required("DATABASE_URL"),
 
@@ -29,7 +34,18 @@ export const env = {
     },
   },
 
-  resendApiKey: process.env.RESEND_API_KEY ?? "",
+  // Plain Gmail SMTP via an app password — sends as the real mailbox
+  // directly, no third-party email service or domain/DNS involved. Needs
+  // 2-Step Verification enabled on the Google account and an app password
+  // generated from it (myaccount.google.com/apppasswords); the app password
+  // keeps working even if the account's verification phone number later
+  // changes — it's tied to 2FA being on, not to any specific phone number.
+  gmail: {
+    user: process.env.GMAIL_USER ?? "",
+    appPassword: process.env.GMAIL_APP_PASSWORD ?? "",
+  },
+  // Must match gmail.user exactly (Gmail SMTP overrides/rejects a mismatched
+  // From) — a display name is fine, e.g. "Mansello <user@gmail.com>".
   emailFrom: process.env.EMAIL_FROM ?? "Mansello <bookings@mansello.com>",
 
   s3: {

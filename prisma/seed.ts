@@ -15,10 +15,26 @@ async function upsertPricingTier(
   });
 }
 
+// Comune di Bologna, 2026 rates — imposta di soggiorno, banded by the
+// room's price per person per night. See BACKEND_CHANGES_CITY_TAX.md.
+const bolognaCityTaxBands = [
+  { minPricePerPersonPerNight: 1, maxPricePerPersonPerNight: 30.99, ratePerPersonPerNight: 4.0 },
+  { minPricePerPersonPerNight: 31, maxPricePerPersonPerNight: 70.99, ratePerPersonPerNight: 5.8 },
+  { minPricePerPersonPerNight: 71, maxPricePerPersonPerNight: 120.99, ratePerPersonPerNight: 6.5 },
+  { minPricePerPersonPerNight: 121, maxPricePerPersonPerNight: null, ratePerPersonPerNight: 7.0 },
+];
+
 async function main() {
+  const bolognaCityTax = {
+    cityTaxEnabled: true,
+    cityTaxMaxNights: 5,
+    cityTaxExemptAgeUnder: 14,
+    cityTaxBands: bolognaCityTaxBands,
+  };
+
   const bologna = await prisma.property.upsert({
     where: { slug: "the-nest-bologna" },
-    update: { currency: "eur" },
+    update: { currency: "eur", ...bolognaCityTax },
     create: {
       slug: "the-nest-bologna",
       name: "The Nest Bologna",
@@ -35,6 +51,7 @@ async function main() {
       airbnbIcalImportUrls: [
         "https://www.airbnb.com/calendar/ical/1695778052767952475.ics?t=f7766ba85b034110a3eb73acd779bfb0&locale=en-GB",
       ],
+      ...bolognaCityTax,
     },
   });
 
