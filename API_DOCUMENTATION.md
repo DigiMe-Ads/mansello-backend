@@ -227,6 +227,8 @@ are, so this is deliberately not role-split further for now.
 | GET | `/api/admin/me` | any admin | Current admin identity from the access token |
 | GET | `/api/admin/dashboard` | any admin | Upcoming check-ins/outs (next 7 days), revenue per property, low-stock count, pending-orders count |
 | POST | `/api/admin/users` | super_admin | Create an admin account. Body: `{ email, password, role, propertyScopeId? }` — there is no public signup route |
+| GET | `/api/admin/users` | super_admin | List all admin accounts (`id, email, role, propertyScopeId, createdAt` — never `passwordHash`) |
+| DELETE | `/api/admin/users/:id` | super_admin | Remove an admin account. `400` if you try to delete the account you're currently authenticated as (avoids stranding your own session with no other super_admin to undo it); `404` if the id doesn't exist. No "last super_admin" guard — it's possible to delete every super_admin account, so be deliberate |
 
 ## 12. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
 

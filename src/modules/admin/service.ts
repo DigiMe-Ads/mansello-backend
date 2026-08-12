@@ -93,3 +93,16 @@ export async function createAdminUser(input: {
     select: { id: true, email: true, role: true, propertyScopeId: true },
   });
 }
+
+export function listAdminUsers() {
+  return prisma.adminUser.findMany({
+    select: { id: true, email: true, role: true, propertyScopeId: true, createdAt: true },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+export async function deleteAdminUser(id: string) {
+  const admin = await prisma.adminUser.findUnique({ where: { id } });
+  if (!admin) throw ApiError.notFound("Admin user not found");
+  await prisma.adminUser.delete({ where: { id } });
+}
