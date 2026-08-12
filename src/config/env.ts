@@ -9,18 +9,17 @@ function required(name: string): string {
 export const env = {
   port: Number(process.env.PORT ?? 4000),
   nodeEnv: process.env.NODE_ENV ?? "development",
-  // Comma-separated list, e.g. "https://mansello.vercel.app,https://mansello.com".
-  // Trailing slashes stripped defensively — the browser's actual Origin
-  // header never has one, so a pasted URL with one would silently never
-  // match otherwise. The `cors` package's `origin` option accepts an array
-  // natively, so no other code needs to change to allow more than one site.
-  corsOrigin: (
-    // process.env.CORS_ORIGIN ??
-    "https://mansello.com"
-  )
-    .split(",")
-    .map((o) => o.trim().replace(/\/$/, ""))
-    .filter(Boolean),
+  // Hardcoded rather than read from CORS_ORIGIN — a bad/missing env var on
+  // Railway silently broke this in production once already, so the known
+  // set of real sites is guaranteed correct regardless of dashboard config.
+  // CORS_ORIGIN in .env.example is now purely informational/unused; update
+  // this array (and redeploy) to actually change allowed origins.
+  corsOrigin: [
+    "http://localhost:3000",
+    "https://mansello.vercel.app",
+    "https://mansello.com",
+    "https://www.mansello.com",
+  ],
   // Used to build guest-facing links we email out (e.g. the booking-info
   // form) — same origin the frontend is served from, so no reason for this
   // to differ from CORS_ORIGIN in practice, but kept as its own var since
