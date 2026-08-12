@@ -4,7 +4,13 @@ import type SMTPTransport from "nodemailer/lib/smtp-transport";
 import { env } from "@/config/env";
 
 const GMAIL_SMTP_HOST = "smtp.gmail.com";
-const GMAIL_SMTP_PORT = 465;
+// 587 (STARTTLS/"submission"), not 465 (implicit TLS) — Railway's outbound
+// network times out connecting to 465 (ETIMEDOUT, CONN — nothing to do with
+// the app itself, confirmed working locally 8/8 against the same host/auth),
+// which matches how a lot of PaaS/cloud egress restricts SMTP ports by
+// default. 587 is the standard client-submission port and is more commonly
+// left open than 465 for exactly this reason.
+const GMAIL_SMTP_PORT = 587;
 
 // `servername` is a real, documented smtp-connection option (TLS SNI +
 // certificate hostname override, needed below since `host` becomes a bare
@@ -58,7 +64,8 @@ async function send(to: string, subject: string, html: string) {
     // our own IPv4 lookup itself fails — better than not sending at all.
     host: ipv4Host ?? GMAIL_SMTP_HOST,
     port: GMAIL_SMTP_PORT,
-    secure: true,
+    secure: false, // 587 = STARTTLS, negotiated after connecting — not implicit TLS like 465
+    requireTLS: true, // fail loudly rather than silently fall back to a plaintext connection
     servername: GMAIL_SMTP_HOST,
     auth: { user: env.gmail.user, pass: env.gmail.appPassword },
   };
