@@ -9,7 +9,15 @@ function required(name: string): string {
 export const env = {
   port: Number(process.env.PORT ?? 4000),
   nodeEnv: process.env.NODE_ENV ?? "development",
-  corsOrigin: process.env.CORS_ORIGIN ?? "http://localhost:3000",
+  // Comma-separated list, e.g. "https://mansello.vercel.app,https://mansello.com".
+  // Trailing slashes stripped defensively — the browser's actual Origin
+  // header never has one, so a pasted URL with one would silently never
+  // match otherwise. The `cors` package's `origin` option accepts an array
+  // natively, so no other code needs to change to allow more than one site.
+  corsOrigin: (process.env.CORS_ORIGIN ?? "http://localhost:3000")
+    .split(",")
+    .map((o) => o.trim().replace(/\/$/, ""))
+    .filter(Boolean),
   // Used to build guest-facing links we email out (e.g. the booking-info
   // form) — same origin the frontend is served from, so no reason for this
   // to differ from CORS_ORIGIN in practice, but kept as its own var since
