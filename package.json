@@ -28,7 +28,7 @@
     "multer": "^2.2.0",
     "node-cron": "^3.0.3",
     "node-ical": "^0.20.1",
-    "nodemailer": "^9.0.5",
+    "resend": "^6.19.0",
     "stripe": "^16.9.0",
     "zod": "^3.23.8"
   },
@@ -44,7 +44,6 @@
     "@types/multer": "^2.2.0",
     "@types/node": "^20.16.5",
     "@types/node-cron": "^3.0.11",
-    "@types/nodemailer": "^8.0.1",
     "@typescript-eslint/eslint-plugin": "^8.5.0",
     "@typescript-eslint/parser": "^8.5.0",
     "eslint": "^8.57.0",

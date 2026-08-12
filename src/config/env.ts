@@ -44,19 +44,15 @@ export const env = {
     },
   },
 
-  // Plain Gmail SMTP via an app password — sends as the real mailbox
-  // directly, no third-party email service or domain/DNS involved. Needs
-  // 2-Step Verification enabled on the Google account and an app password
-  // generated from it (myaccount.google.com/apppasswords); the app password
-  // keeps working even if the account's verification phone number later
-  // changes — it's tied to 2FA being on, not to any specific phone number.
-  gmail: {
-    user: process.env.GMAIL_USER ?? "",
-    appPassword: process.env.GMAIL_APP_PASSWORD ?? "",
-  },
-  // Must match gmail.user exactly (Gmail SMTP overrides/rejects a mismatched
-  // From) — a display name is fine, e.g. "Mansello <user@gmail.com>".
+  // Resend (HTTPS API, not SMTP — see notifications/email.ts for why).
+  // `from` must be on a domain verified in Resend's dashboard (DKIM/SPF/
+  // DMARC DNS records) — mansello.com is verified, so this can't be a raw
+  // @gmail.com address no matter what EMAIL_FROM is set to.
+  resendApiKey: process.env.RESEND_API_KEY ?? "",
   emailFrom: process.env.EMAIL_FROM ?? "Mansello <bookings@mansello.com>",
+  // Optional — where replies to guest-facing emails actually land, since
+  // EMAIL_FROM is a send-only domain address, not a real inbox.
+  emailReplyTo: process.env.EMAIL_REPLY_TO ?? "",
 
   s3: {
     endpoint: process.env.S3_ENDPOINT ?? "",
