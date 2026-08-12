@@ -4,3 +4,6 @@ dist/
 .env.local
 *.log
 .DS_Store
+# Machine-specific TLS-inspection root certs (e.g. NODE_EXTRA_CA_CERTS for
+# local antivirus/corporate-proxy interception) — never something to ship.
+certs/
