@@ -14,7 +14,10 @@ export const env = {
   // header never has one, so a pasted URL with one would silently never
   // match otherwise. The `cors` package's `origin` option accepts an array
   // natively, so no other code needs to change to allow more than one site.
-  corsOrigin: (process.env.CORS_ORIGIN ?? "http://localhost:3000")
+  corsOrigin: (
+    process.env.CORS_ORIGIN ??
+    "http://localhost:3000,https://mansello.vercel.app,https://mansello.com,https://www.mansello.com"
+  )
     .split(",")
     .map((o) => o.trim().replace(/\/$/, ""))
     .filter(Boolean),
