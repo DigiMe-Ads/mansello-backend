@@ -35,10 +35,16 @@ export async function deleteCategory(id: string) {
   await prisma.category.delete({ where: { id } });
 }
 
-export function listProducts(categorySlug?: string) {
+// Same dual-purpose shape as blog's listPosts (API_DOCUMENTATION.md §10) —
+// public/no-token callers (the storefront) only ever see active products;
+// a super_admin/marketplace_manager token includes inactive ones too, so
+// the admin product list can actually find (and reassign/delete) a
+// deactivated product — otherwise it's invisible and permanently stuck
+// blocking its category's deletion.
+export function listProducts(categorySlug?: string, includeInactive = false) {
   return prisma.product.findMany({
     where: {
-      active: true,
+      ...(includeInactive ? {} : { active: true }),
       ...(categorySlug ? { category: { slug: categorySlug } } : {}),
     },
     include: { category: true, stockLevel: true },
@@ -46,8 +52,14 @@ export function listProducts(categorySlug?: string) {
   });
 }
 
-export function getProduct(id: string) {
-  return prisma.product.findUnique({ where: { id }, include: { category: true, stockLevel: true } });
+// Same admin-branch as listProducts, for consistency — an inactive product
+// 404s for a public/non-admin caller now instead of being reachable by
+// anyone who has (or guesses) its id.
+export function getProduct(id: string, includeInactive = false) {
+  return prisma.product.findFirst({
+    where: { id, ...(includeInactive ? {} : { active: true }) },
+    include: { category: true, stockLevel: true },
+  });
 }
 
 export function createProduct(input: {

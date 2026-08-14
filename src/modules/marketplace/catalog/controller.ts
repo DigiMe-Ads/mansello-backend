@@ -16,12 +16,19 @@ export async function deleteCategory(req: Request, res: Response) {
   res.status(204).send();
 }
 
+// Populated by optionalAuth in routes.ts — never required, just read if present.
+function isCatalogAdmin(req: Request) {
+  return req.admin?.role === "super_admin" || req.admin?.role === "marketplace_manager";
+}
+
 export async function listProducts(req: Request, res: Response) {
-  res.json(await service.listProducts(req.query.category as string | undefined));
+  res.json(
+    await service.listProducts(req.query.category as string | undefined, isCatalogAdmin(req))
+  );
 }
 
 export async function getProduct(req: Request, res: Response) {
-  const product = await service.getProduct(req.params.id);
+  const product = await service.getProduct(req.params.id, isCatalogAdmin(req));
   if (!product) throw ApiError.notFound("Product not found");
   res.json(product);
 }
