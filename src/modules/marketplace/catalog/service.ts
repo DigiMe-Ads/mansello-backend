@@ -17,6 +17,24 @@ export async function createCategory(input: { name: string; slug?: string }) {
   return prisma.category.create({ data: { name: input.name.trim(), slug } });
 }
 
+// categoryId is required on Product, so a category can't just be deleted out
+// from under its products — the FK would reject it anyway, but a pre-check
+// gives a clear message instead of a raw constraint error. Delete/reassign
+// the products first, then the now-empty category.
+export async function deleteCategory(id: string) {
+  const category = await prisma.category.findUnique({ where: { id } });
+  if (!category) throw ApiError.notFound("Category not found");
+
+  const productCount = await prisma.product.count({ where: { categoryId: id } });
+  if (productCount > 0) {
+    throw ApiError.conflict(
+      `This category still has ${productCount} product(s) — delete or move them first`
+    );
+  }
+
+  await prisma.category.delete({ where: { id } });
+}
+
 export function listProducts(categorySlug?: string) {
   return prisma.product.findMany({
     where: {
@@ -63,9 +81,42 @@ export function createProduct(input: {
 
 export function updateProduct(
   id: string,
-  data: Partial<{ name: string; description: string; priceUsd: number; images: string[]; active: boolean }>
+  data: Partial<{
+    categoryId: string;
+    name: string;
+    description: string;
+    priceUsd: number;
+    images: string[];
+    active: boolean;
+  }>
+  // Same trust level as createProduct — categoryId isn't pre-validated
+  // against Category here either; an unknown id surfaces as the FK
+  // constraint rejecting the write, not a clean ApiError. Lets an admin
+  // move a product to another category, e.g. to empty one out before
+  // deleting it (see deleteCategory above).
 ) {
   return prisma.product.update({ where: { id }, data });
+}
+
+// A product that's actually been ordered keeps its row referenced by
+// OrderItem (which snapshots name/price at time of purchase, so historical
+// orders don't depend on the product still existing) — hard-deleting it
+// would break that FK for no good reason. Deactivating (already-supported
+// via PATCH { active: false }) is the right move there instead; a genuine
+// leftover-test product with no order history deletes cleanly, and its
+// StockLevel row cascades with it.
+export async function deleteProduct(id: string) {
+  const product = await prisma.product.findUnique({ where: { id } });
+  if (!product) throw ApiError.notFound("Product not found");
+
+  const orderItemCount = await prisma.orderItem.count({ where: { productId: id } });
+  if (orderItemCount > 0) {
+    throw ApiError.conflict(
+      "This product has order history and can't be deleted — deactivate it instead (PATCH active: false)"
+    );
+  }
+
+  await prisma.product.delete({ where: { id } });
 }
 
 export function adjustStock(productId: string, delta: number) {

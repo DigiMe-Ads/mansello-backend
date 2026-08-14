@@ -155,11 +155,13 @@ Register both endpoints in each Stripe dashboard, subscribed to at least
 |---|---|---|---|
 | GET | `/api/marketplace/catalog/categories` | public | List categories |
 | POST | `/api/marketplace/catalog/categories` | super_admin, marketplace_manager | Body: `{ name, slug? }` — `slug` is derived from `name` if omitted. `409` if the slug already exists |
+| DELETE | `/api/marketplace/catalog/categories/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it still has any products — delete or move them first, no cascade |
 | GET | `/api/marketplace/catalog/products?category=slug` | public | Active products, optional category filter |
 | GET | `/api/marketplace/catalog/products/:id` | public | Single product |
 | POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §13.9, new code should use that instead |
 | POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold? }` |
-| PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `name`, `description`, `priceUsd`, `images`, `active` |
+| PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `categoryId`, `name`, `description`, `priceUsd`, `images`, `active` — `categoryId` lets a product move to a different category, e.g. to empty one out before deleting it |
+| DELETE | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it has any order history (real orders reference it) — deactivate instead (`PATCH { active: false }`), which already hides it from the storefront without touching order records. A never-ordered product deletes cleanly, its stock row goes with it |
 | POST | `/api/marketplace/catalog/products/:id/stock-adjustment` | super_admin, marketplace_manager | Body: `{ delta }` (positive = restock, negative = manual removal) |
 | GET | `/api/marketplace/catalog/low-stock` | super_admin, marketplace_manager | Products at/below their `lowStockThreshold` |
 

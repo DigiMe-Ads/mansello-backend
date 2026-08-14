@@ -19,9 +19,11 @@ router.get("/products/:id", asyncHandler(controller.getProduct));
 // Admin — marketplace_manager or super_admin.
 const manager = [requireAuth, requireRole("super_admin", "marketplace_manager")] as const;
 router.post("/categories", ...manager, asyncHandler(controller.createCategory));
+router.delete("/categories/:id", ...manager, asyncHandler(controller.deleteCategory));
 router.post("/products/images", ...manager, upload.array("images", 10), asyncHandler(controller.uploadProductImages));
 router.post("/products", ...manager, asyncHandler(controller.createProduct));
 router.patch("/products/:id", ...manager, asyncHandler(controller.updateProduct));
+router.delete("/products/:id", ...manager, asyncHandler(controller.deleteProduct));
 router.post("/products/:id/stock-adjustment", ...manager, asyncHandler(controller.adjustStock));
 router.get("/low-stock", ...manager, asyncHandler(controller.listLowStock));
 

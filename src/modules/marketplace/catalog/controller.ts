@@ -11,6 +11,11 @@ export async function createCategory(req: Request, res: Response) {
   res.status(201).json(await service.createCategory(req.body));
 }
 
+export async function deleteCategory(req: Request, res: Response) {
+  await service.deleteCategory(req.params.id);
+  res.status(204).send();
+}
+
 export async function listProducts(req: Request, res: Response) {
   res.json(await service.listProducts(req.query.category as string | undefined));
 }
@@ -38,6 +43,11 @@ export async function createProduct(req: Request, res: Response) {
 
 export async function updateProduct(req: Request, res: Response) {
   res.json(await service.updateProduct(req.params.id, req.body));
+}
+
+export async function deleteProduct(req: Request, res: Response) {
+  await service.deleteProduct(req.params.id);
+  res.status(204).send();
 }
 
 export async function adjustStock(req: Request, res: Response) {
