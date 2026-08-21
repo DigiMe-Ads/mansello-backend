@@ -466,7 +466,11 @@ export async function cancelBooking(bookingId: string, refundOverride?: number, 
   const refundAmount =
     refundOverride ?? computeRefundAmount(Number(booking.totalPrice), booking.checkIn);
 
-  await prisma.$transaction([
+  // Capture the update's own result rather than returning the pre-fetch
+  // above — that row is stale the moment the transaction commits (still
+  // shows the pre-cancellation status/cancelledAt), which used to be what
+  // this function handed back to the API caller.
+  const [updatedBooking] = await prisma.$transaction([
     prisma.booking.update({
       where: { id: bookingId },
       data: { status: "cancelled", cancelledAt: new Date(), refundAmount, refundReason: reason },
@@ -476,5 +480,5 @@ export async function cancelBooking(bookingId: string, refundOverride?: number, 
 
   // Actual Stripe refund call happens in modules/payments — triggered from the controller
   // so this service function stays payment-provider agnostic.
-  return { booking, refundAmount };
+  return { booking: updatedBooking, refundAmount };
 }
