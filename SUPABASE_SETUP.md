@@ -138,51 +138,55 @@ stock_levels, orders, order_items, contact_messages, admin_users).
 
 ---
 
-## 4. Add the exclusion constraint (the one thing Prisma can't express)
+## 4. The exclusion constraints (the one thing Prisma can't express)
 
 Prisma's schema language has no way to declare a Postgres `EXCLUDE USING gist`
-constraint, so it goes in as a follow-up raw-SQL migration. Keep it in
-migration history rather than pasting it ad hoc into the SQL Editor — otherwise
-a fresh environment won't have it.
+constraint, so these go in as raw-SQL migrations rather than the schema file.
+They're already in migration history (`npm run prisma:deploy` /
+`npx prisma migrate dev` picks them up automatically on a fresh environment
+like every other migration) — nothing to paste by hand, this section is just
+explaining what's there and why, for when you're staring at the SQL Editor
+trying to understand why a write got rejected.
 
-```bash
-npx prisma migrate dev --create-only --name availability_exclusion_constraint
-```
+**Original constraint** (`prisma/migrations/20260723081553_init`, and
+`prisma/migrations_manual/001_exclusion_constraint.sql` for the same SQL kept
+as a standalone reference): one `EXCLUDE USING gist` on `AvailabilityBlock`
+guaranteeing no two active rows overlap for the same property — covers
+direct bookings, Airbnb imports, and manual blocks all at once, even under
+concurrent requests, since they all live in this one table.
 
-Open the generated empty file at
-`prisma/migrations/<timestamp>_availability_exclusion_constraint/migration.sql`
-and paste in:
+**Superseded by two narrower constraints** once individually-bookable rooms
+existed (`prisma/migrations/20260815000000_sri_lanka_rooms` — see that
+file's comments for the full reasoning): a single constraint can't express
+"a whole-property block (`roomId IS NULL`) conflicts with every room, but
+two different rooms don't conflict with each other" — Postgres has no
+EXCLUDE operator for "NULL matches every value". Split into:
 
-```sql
--- Needed for GiST indexes over a plain equality column (propertyId) mixed
--- with a range type (daterange) in the same exclusion constraint.
-CREATE EXTENSION IF NOT EXISTS btree_gist;
+1. Two whole-property blocks can't overlap (`roomId IS NULL` on both) — for
+   any property with zero rooms (The Nest Bologna) this is the exact same
+   guarantee as the original constraint, since every one of its blocks is
+   always `roomId IS NULL`. Zero behavior change for that property.
+2. Two blocks on the *same* room can't overlap (`roomId IS NOT NULL` on
+   both, plus the room id itself) — this is what stops two guests racing
+   onto the same physical room concurrently.
 
--- Guarantees, at the database level, that no two ACTIVE rows in
--- AvailabilityBlock can ever overlap for the same property — direct
--- bookings, Airbnb-imported blocks, and manual blocks all live in this one
--- table, so this one constraint covers all three sources at once, even
--- under concurrent requests.
-ALTER TABLE "AvailabilityBlock"
-  ADD CONSTRAINT availability_block_no_overlap
-  EXCLUDE USING gist (
-    "propertyId" WITH =,
-    daterange("startDate", "endDate", '[)') WITH &&
-  )
-  WHERE (status = 'active');
-```
+The remaining case (a whole-property block landing at the same instant as a
+room-specific one) is checked at the application level instead, inside the
+same transaction as the write — see `computeBookingPrice` in
+`modules/bookings/service.ts` and `isRangeFree` in
+`modules/availability/service.ts`. Same class of accepted low-frequency
+residual risk as the `turnoverBufferDays` check and the Airbnb sync-lag
+window already documented elsewhere in this codebase — whole-property
+blocks are an infrequent, admin/import-driven write, not a high-concurrency
+guest-facing one.
 
-Then apply it:
-
-```bash
-npx prisma migrate dev
-```
-
-> Do **not** enable `btree_gist` via the dashboard toggle (Database →
-> Extensions). That installs it into the `extensions` schema, which can leave
-> the gist operator classes off your search path when the `ALTER TABLE` runs.
-> The `CREATE EXTENSION` line inside the migration installs it into `public`,
-> where it just works — and it travels with the repo.
+Both migrations need `btree_gist` (needed for a GiST index over a plain
+equality column mixed with a range type in the same constraint), installed
+via `CREATE EXTENSION IF NOT EXISTS btree_gist` inside the migration itself
+— installs into `public`, travels with the repo. Do **not** enable it via
+the dashboard toggle (Database → Extensions) instead — that installs it into
+the `extensions` schema, which can leave the gist operator classes off your
+search path when the `ALTER TABLE` runs.
 
 For deploys rather than local dev: `npm run prisma:deploy`
 (`prisma migrate deploy`) applies pending migrations without prompting or

@@ -22,6 +22,7 @@ import {
   bookingRoutes as bookingInfoRequestRoutes,
   publicRoutes as bookingInfoPublicRoutes,
 } from "@/modules/guestInfo/routes";
+import { propertyRoomsRoutes, roomRoutes } from "@/modules/rooms/routes";
 
 export function createApp() {
   const app = express();
@@ -42,6 +43,10 @@ export function createApp() {
   app.use("/ical", icalExportRoutes);
 
   app.use("/api/properties", propertiesRoutes);
+  // Adds /:propertyId/rooms on top of the routes above — a separate router
+  // (see modules/rooms/routes.ts) so that module stays self-contained.
+  app.use("/api/properties", propertyRoomsRoutes);
+  app.use("/api/rooms", roomRoutes);
   app.use("/api/availability", availabilityRoutes);
   app.use("/api/bookings", bookingsRoutes);
   // Adds /:id/info-requests on top of the routes above — a separate router

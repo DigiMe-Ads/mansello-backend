@@ -1,8 +1,11 @@
 // Mansello backend — Prisma schema
-// NOTE: the Postgres exclusion constraint that guarantees no two active
-// bookings/blocks can overlap for the same property CANNOT be expressed here.
-// It is added by a raw-SQL migration — see prisma/migrations_manual/001_exclusion_constraint.sql
-// and SUPABASE_SETUP.md for the exact statement to run.
+// NOTE: the Postgres exclusion constraints that guarantee no two active
+// bookings/blocks can overlap for the same property (or the same room)
+// CANNOT be expressed here. They're added by raw-SQL migrations — see
+// prisma/migrations_manual/001_exclusion_constraint.sql (the original,
+// pre-rooms single constraint) and prisma/migrations/20260815000000_sri_lanka_rooms
+// (splits it into two, one whole-property-only and one same-room-only —
+// see that migration's comments for why) and SUPABASE_SETUP.md.
 
 generator client {
   provider = "prisma-client-js"
@@ -119,6 +122,30 @@ model Property {
   transportRequests  TransportRequest[]
   adminUsers         AdminUser[]
   offers             Offer[]
+  rooms              Room[]
+}
+
+// Individually-bookable rooms (Dona's Villa) — a property with zero Room
+// rows keeps booking as a single unit via PricingTier exactly as before
+// (The Nest Bologna); every change this model brought with it is additive
+// and no-ops for that case. See BACKEND_CHANGES_SRI_LANKA_ROOMS.md.
+model Room {
+  id            String   @id @default(uuid())
+  propertyId    String
+  property      Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  name          String
+  subtitle      String?
+  capacity      Int // max guests this room sleeps
+  pricePerNight Decimal  @db.Decimal(10, 2)
+  images        String[] @default([])
+  sortOrder     Int      @default(0)
+  active        Boolean  @default(true) // false retires a room without breaking historical bookings/blocks that reference it
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  availabilityBlocks AvailabilityBlock[]
+
+  @@index([propertyId, active])
 }
 
 model PricingTier {
@@ -141,18 +168,31 @@ model AvailabilityBlock {
   id          String             @id @default(uuid())
   propertyId  String
   property    Property           @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  // null = blocks every room on the property (whole-property block — what
+  // every block was before rooms existed: manual blocks, Airbnb imports,
+  // and any property with zero rooms all keep using this unchanged). Set =
+  // blocks just that one room. See modules/bookings/service.ts and
+  // modules/availability/service.ts for how overlap is actually enforced
+  // across the null/specific split — it's split across two exclusion
+  // constraints (SUPABASE_SETUP.md) plus one application-level check,
+  // not a single constraint, because Postgres has no operator for
+  // "NULL matches every value" inside an EXCLUDE.
+  roomId      String?
+  room        Room?              @relation(fields: [roomId], references: [id], onDelete: Cascade)
   startDate   DateTime           @db.Date
   endDate     DateTime           @db.Date
   source      AvailabilitySource
   status      BlockStatus        @default(active)
   externalUid String? // Airbnb UID, used to dedupe on re-sync
-  bookingId   String?            @unique
+  bookingId   String? // no longer unique — a room booking creates one block per reserved room, all sharing one bookingId
   booking     Booking?           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   createdAt   DateTime           @default(now())
   updatedAt   DateTime           @updatedAt
 
   @@index([propertyId, status])
   @@index([externalUid])
+  @@index([roomId, status])
+  @@index([bookingId])
 }
 
 model Booking {
@@ -167,7 +207,8 @@ model Booking {
   checkIn               DateTime      @db.Date
   checkOut              DateTime      @db.Date
   guests                Int
-  rooms                 Int           @default(1) // which PricingTier (guestCount, rooms) priced this stay
+  rooms                 Int           @default(1) // room *count* — which PricingTier (guestCount, rooms) priced this stay for a non-room property; for a room-booking this is just roomIds.length, derived server-side
+  roomIds               String[]      @default([]) // specific Room ids reserved — non-empty iff the property has rooms configured, empty for single-unit properties (The Nest Bologna)
   accommodationPrice    Decimal       @db.Decimal(10, 2) // pure room cost: pricePerNight × nights — what totalPrice meant before city tax existed
   cityTax               Decimal       @default(0) @db.Decimal(10, 2) // computed from Property.cityTaxBands; 0 when the property doesn't have cityTaxEnabled
   childrenUnder14       Int           @default(0) // recorded for audit — the exemption math is already baked into cityTax by the time this is stored
@@ -182,9 +223,12 @@ model Booking {
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
 
-  availabilityBlock AvailabilityBlock?
-  transportRequests TransportRequest[]
-  infoRequests      BookingInfoRequest[]
+  // Plural now — a room-booking creates one AvailabilityBlock per reserved
+  // room instead of the single whole-property block a non-room booking
+  // still creates (bookingId is no longer unique on that table).
+  availabilityBlocks AvailabilityBlock[]
+  transportRequests  TransportRequest[]
+  infoRequests       BookingInfoRequest[]
 
   @@index([propertyId, status])
 }

@@ -7,12 +7,13 @@ export async function listBlocks(req: Request, res: Response) {
 }
 
 export async function createManualBlock(req: Request, res: Response) {
-  const { startDate, endDate, reason } = req.body;
+  const { startDate, endDate, reason, roomId } = req.body;
   const block = await service.createManualBlock({
     propertyId: req.params.propertyId,
     startDate: new Date(startDate),
     endDate: new Date(endDate),
     reason,
+    roomId,
   });
   res.status(201).json(block);
 }

@@ -13,6 +13,11 @@ const bookingBody = z
     guests: z.coerce.number().int().min(1),
     rooms: z.coerce.number().int().min(1).optional(),
     childrenUnder14: z.coerce.number().int().min(0).optional(),
+    // Individually-bookable rooms (Dona's Villa) — required by
+    // computeBookingPrice for a property that has rooms configured, ignored
+    // (must be empty/omitted) for one that doesn't. `rooms` above is derived
+    // from this server-side when present, not trusted from the client.
+    roomIds: z.array(z.string().uuid()).optional(),
   })
   // Cheap insurance, not a substitute for server-side trust — this is public,
   // unauthenticated input, and the frontend already clamps this client-side.

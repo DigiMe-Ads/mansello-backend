@@ -53,18 +53,24 @@ function computeCityTax(
   return band ? taxableGuests * taxedNights * band.ratePerPersonPerNight : 0;
 }
 
-// The price a guest pays is never taken from the request — it's always looked
-// up from the property's own PricingTier table (guestCount x rooms), same as
-// how marketplace orders snapshot productPrice from the DB rather than trust
-// the client. This also validates guest count / room count / minNights against
-// the property's actual configuration.
+// The price a guest pays is never taken from the request. For a property
+// with zero rooms configured (The Nest Bologna), it's looked up from
+// PricingTier (guestCount x rooms) exactly as before — every room-related
+// branch below no-ops for that property. For a property with rooms
+// configured (Dona's Villa), roomIds is required and the price is the sum
+// of the selected rooms' own pricePerNight — see
+// BACKEND_CHANGES_SRI_LANKA_ROOMS.md. Either way this also validates guest
+// count / minNights / (room count or room selection) against the
+// property's actual configuration, same as how marketplace orders snapshot
+// productPrice from the DB rather than trust the client.
 export async function computeBookingPrice(
   propertyId: string,
   checkIn: Date,
   checkOut: Date,
   guests: number,
   rooms: number,
-  childrenUnder14 = 0
+  childrenUnder14 = 0,
+  roomIds?: string[]
 ) {
   const property = await prisma.property.findUnique({ where: { id: propertyId } });
   if (!property) throw ApiError.notFound("Property not found");
@@ -80,11 +86,13 @@ export async function computeBookingPrice(
 
   // Enforces the property's cleaning/turnover gap between stays. This is an
   // application-level check only — unlike the exact-overlap case (which the
-  // DB exclusion constraint guarantees even under concurrency), there's no
-  // per-property-configurable buffer expressible in that constraint, so two
+  // DB exclusion constraints guarantee even under concurrency), there's no
+  // per-property-configurable buffer expressible in those constraints, so two
   // requests racing for buffer-adjacent dates at the same instant is a
   // theoretical residual risk, same class as the Airbnb sync-lag risk in
   // BACKEND_PLAN.md §4. Low-stakes enough not to warrant a locking scheme.
+  // Applies at the whole-property level regardless of rooms — unaffected by
+  // any of the room logic below.
   if (property.turnoverBufferDays > 0) {
     const bufferMs = property.turnoverBufferDays * MS_PER_DAY;
     const tooClose = await prisma.availabilityBlock.findFirst({
@@ -102,15 +110,51 @@ export async function computeBookingPrice(
     }
   }
 
-  const tier = await prisma.pricingTier.findUnique({
-    where: { propertyId_guestCount_rooms: { propertyId, guestCount: guests, rooms } },
-  });
-  if (!tier) {
-    throw ApiError.badRequest(`No price is configured for ${guests} guest(s) in ${rooms} room(s) at this property`);
+  const activeRoomCount = await prisma.room.count({ where: { propertyId, active: true } });
+
+  let pricePerNight: number;
+  let selectedRooms: Awaited<ReturnType<typeof prisma.room.findMany>> = [];
+
+  if (activeRoomCount > 0) {
+    // Room-booking property — roomIds is how the guest picks, not a count.
+    if (!roomIds || roomIds.length === 0) {
+      throw ApiError.badRequest("This property books by individual room — select at least one room");
+    }
+    selectedRooms = await prisma.room.findMany({
+      where: { id: { in: roomIds }, propertyId, active: true },
+    });
+    // Catches an unknown id, a room belonging to a different property, an
+    // inactive (retired) room, or a duplicate id in the array all at once —
+    // any of those means the count of matched rows won't equal the count asked for.
+    if (selectedRooms.length !== roomIds.length) {
+      throw ApiError.badRequest("One or more selected rooms are invalid for this property");
+    }
+    const totalCapacity = selectedRooms.reduce((sum, r) => sum + r.capacity, 0);
+    if (totalCapacity < guests) {
+      throw ApiError.badRequest(
+        `The selected room(s) sleep ${totalCapacity} — select more rooms for a party of ${guests}`
+      );
+    }
+    pricePerNight = selectedRooms.reduce((sum, r) => sum + Number(r.pricePerNight), 0);
+  } else {
+    // Non-room property — unchanged PricingTier lookup.
+    if (roomIds && roomIds.length > 0) {
+      throw ApiError.badRequest("This property doesn't book by individual room");
+    }
+    const tier = await prisma.pricingTier.findUnique({
+      where: { propertyId_guestCount_rooms: { propertyId, guestCount: guests, rooms } },
+    });
+    if (!tier) {
+      throw ApiError.badRequest(`No price is configured for ${guests} guest(s) in ${rooms} room(s) at this property`);
+    }
+    pricePerNight = Number(tier.pricePerNight);
   }
 
-  const pricePerNight = Number(tier.pricePerNight);
   const accommodationPrice = pricePerNight * nights;
+  // Composes the same way regardless of source — tax is banded off the
+  // underlying pricePerNight either way, whether that's one tier's price or
+  // several rooms' summed rate. Moot for Dona's Villa today (cityTaxEnabled
+  // is Bologna-only) but stays correct if that ever changes.
   const cityTax = computeCityTax(property, pricePerNight, nights, guests, childrenUnder14);
 
   return {
@@ -121,6 +165,7 @@ export async function computeBookingPrice(
     cityTax,
     totalPrice: accommodationPrice + cityTax, // <- what actually gets charged
     currency: property.currency,
+    rooms: selectedRooms, // empty for a non-room booking
   };
 }
 
@@ -136,12 +181,74 @@ export interface CreatePendingBookingInput {
   guests: number;
   rooms: number;
   childrenUnder14?: number;
+  roomIds?: string[];
 }
 
-// The exclusion constraint (see SUPABASE_SETUP.md) is what actually prevents
-// two concurrent requests from both winning the same date range — this
-// transaction just needs to attempt the insert and translate a DB-level
-// rejection into a clean 409 for the API caller.
+// Creates the AvailabilityBlock row(s) for a booking inside its transaction
+// — one whole-property block (roomId null) for a non-room booking, exactly
+// as before, or one block per reserved room for a room-booking. Either way
+// relies on the DB exclusion constraints (SUPABASE_SETUP.md) to guarantee,
+// even under concurrency, that the insert(s) fail if a same-scope block
+// already covers these dates — the outer try/catch in each caller below
+// translates that into a clean 409.
+//
+// The one case those constraints can't express — a whole-property block
+// already covering these dates for a room-booking — is checked here
+// explicitly before the per-room inserts, via the same tx client so it sees
+// anything already written earlier in this same transaction. This is a
+// narrow, low-frequency residual race (whole-property blocks are an
+// infrequent admin/Airbnb-import write, not a high-concurrency guest-facing
+// one) — same accepted-risk class as the turnoverBufferDays check above.
+async function createBookingAvailabilityBlocks(
+  tx: Prisma.TransactionClient,
+  propertyId: string,
+  bookingId: string,
+  checkIn: Date,
+  checkOut: Date,
+  rooms: { id: string }[]
+) {
+  if (rooms.length === 0) {
+    await tx.availabilityBlock.create({
+      data: {
+        propertyId,
+        startDate: checkIn,
+        endDate: checkOut,
+        source: "direct",
+        status: "active",
+        bookingId,
+      },
+    });
+    return;
+  }
+
+  const wholePropertyBlock = await tx.availabilityBlock.findFirst({
+    where: {
+      propertyId,
+      roomId: null,
+      status: "active",
+      startDate: { lt: checkOut },
+      endDate: { gt: checkIn },
+    },
+  });
+  if (wholePropertyBlock) {
+    throw ApiError.conflict("These dates are no longer available for this property.");
+  }
+
+  for (const room of rooms) {
+    await tx.availabilityBlock.create({
+      data: {
+        propertyId,
+        roomId: room.id,
+        startDate: checkIn,
+        endDate: checkOut,
+        source: "direct",
+        status: "active",
+        bookingId,
+      },
+    });
+  }
+}
+
 export async function createPendingBooking(input: CreatePendingBookingInput) {
   const priced = await computeBookingPrice(
     input.propertyId,
@@ -149,9 +256,11 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
     input.checkOut,
     input.guests,
     input.rooms,
-    input.childrenUnder14
+    input.childrenUnder14,
+    input.roomIds
   );
   const expiresAt = new Date(Date.now() + env.bookingHoldMinutes * 60_000);
+  const roomIds = priced.rooms.map((r) => r.id);
 
   try {
     const booking = await prisma.$transaction(async (tx) => {
@@ -166,7 +275,8 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
           checkIn: input.checkIn,
           checkOut: input.checkOut,
           guests: input.guests,
-          rooms: input.rooms,
+          rooms: roomIds.length > 0 ? roomIds.length : input.rooms,
+          roomIds,
           accommodationPrice: priced.accommodationPrice,
           cityTax: priced.cityTax,
           childrenUnder14: input.childrenUnder14 ?? 0,
@@ -177,16 +287,14 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
         },
       });
 
-      await tx.availabilityBlock.create({
-        data: {
-          propertyId: input.propertyId,
-          startDate: input.checkIn,
-          endDate: input.checkOut,
-          source: "direct",
-          status: "active",
-          bookingId: booking.id,
-        },
-      });
+      await createBookingAvailabilityBlocks(
+        tx,
+        input.propertyId,
+        booking.id,
+        input.checkIn,
+        input.checkOut,
+        priced.rooms
+      );
 
       return booking;
     });
@@ -213,8 +321,10 @@ export async function createOfflineBooking(
     input.checkOut,
     input.guests,
     input.rooms,
-    input.childrenUnder14
+    input.childrenUnder14,
+    input.roomIds
   );
+  const roomIds = priced.rooms.map((r) => r.id);
 
   // totalPriceOverride has always meant "this exact figure is what gets
   // charged" — preserved here rather than adding cityTax on top of it (which
@@ -243,7 +353,8 @@ export async function createOfflineBooking(
           checkIn: input.checkIn,
           checkOut: input.checkOut,
           guests: input.guests,
-          rooms: input.rooms,
+          rooms: roomIds.length > 0 ? roomIds.length : input.rooms,
+          roomIds,
           accommodationPrice,
           cityTax,
           childrenUnder14: input.childrenUnder14 ?? 0,
@@ -252,16 +363,16 @@ export async function createOfflineBooking(
           status: "paid_offline",
         },
       });
-      await tx.availabilityBlock.create({
-        data: {
-          propertyId: input.propertyId,
-          startDate: input.checkIn,
-          endDate: input.checkOut,
-          source: "direct",
-          status: "active",
-          bookingId: booking.id,
-        },
-      });
+
+      await createBookingAvailabilityBlocks(
+        tx,
+        input.propertyId,
+        booking.id,
+        input.checkIn,
+        input.checkOut,
+        priced.rooms
+      );
+
       return booking;
     });
   } catch (err) {
