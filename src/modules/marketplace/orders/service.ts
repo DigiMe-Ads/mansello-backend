@@ -1,5 +1,6 @@
 import { prisma } from "@/db/prisma";
 import { ApiError } from "@/utils/ApiError";
+import { computeShippingFee } from "@/modules/marketplace/shipping/service";
 
 const COD_ABUSE_THRESHOLD = 3; // cancelled/returned orders before flagging
 
@@ -16,7 +17,6 @@ export async function createOrder(input: {
   customerPhone: string;
   deliveryAddress: string;
   notes?: string;
-  shippingFee: number;
   items: OrderItemInput[];
 }) {
   const products = await prisma.product.findMany({
@@ -39,7 +39,13 @@ export async function createOrder(input: {
   });
 
   const subtotal = lineItems.reduce((sum, i) => sum + i.lineTotal, 0);
-  const total = subtotal + input.shippingFee;
+  // Computed server-side from the submitted items' weight and the current
+  // ShippingRate table — never taken from the request. Closes the gap
+  // BACKEND_PLAN.md §7 left open (shippingFee used to be a flat,
+  // client-supplied value); see
+  // BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4.
+  const shippingFee = await computeShippingFee(input.items, products);
+  const total = subtotal + shippingFee;
 
   const priorAbuseCount = await prisma.order.count({
     where: { customerPhone: input.customerPhone, status: { in: ["cancelled", "returned"] } },
@@ -52,7 +58,7 @@ export async function createOrder(input: {
       deliveryAddress: input.deliveryAddress,
       notes: input.notes,
       paymentMethod: "cod",
-      shippingFee: input.shippingFee,
+      shippingFee,
       subtotal,
       total,
       flaggedForReview: priorAbuseCount >= COD_ABUSE_THRESHOLD,

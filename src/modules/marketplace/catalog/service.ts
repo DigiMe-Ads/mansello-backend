@@ -6,7 +6,17 @@ export function listCategories() {
   return prisma.category.findMany({ orderBy: { name: "asc" } });
 }
 
-export async function createCategory(input: { name: string; slug?: string }) {
+const MAX_FEATURED_CATEGORIES = 4;
+
+export interface CategoryInput {
+  name: string;
+  slug?: string;
+  description?: string;
+  imageUrl?: string;
+  featured?: boolean;
+}
+
+export async function createCategory(input: CategoryInput) {
   if (!input.name?.trim()) throw ApiError.badRequest("name is required");
   const slug = input.slug?.trim() ? slugify(input.slug) : slugify(input.name);
   if (!slug) throw ApiError.badRequest("Could not derive a valid slug from name");
@@ -14,7 +24,46 @@ export async function createCategory(input: { name: string; slug?: string }) {
   const existing = await prisma.category.findUnique({ where: { slug } });
   if (existing) throw ApiError.conflict(`A category with slug "${slug}" already exists`);
 
-  return prisma.category.create({ data: { name: input.name.trim(), slug } });
+  if (input.featured) await assertFeaturedRoom();
+
+  return prisma.category.create({
+    data: {
+      name: input.name.trim(),
+      slug,
+      description: input.description,
+      imageUrl: input.imageUrl,
+      featured: input.featured ?? false,
+    },
+  });
+}
+
+export function getCategory(id: string) {
+  return prisma.category.findUnique({ where: { id } });
+}
+
+// The frontend also soft-guards this (disables the checkbox once 4 others
+// are already featured), but that's advisory only — this is the actual
+// enforcement. excludeId lets an update re-save a category that's already
+// one of the 4 without tripping over itself.
+async function assertFeaturedRoom(excludeId?: string) {
+  const featuredCount = await prisma.category.count({
+    where: { featured: true, ...(excludeId ? { id: { not: excludeId } } : {}) },
+  });
+  if (featuredCount >= MAX_FEATURED_CATEGORIES) {
+    throw ApiError.conflict(`At most ${MAX_FEATURED_CATEGORIES} categories can be featured at once`);
+  }
+}
+
+export async function updateCategory(
+  id: string,
+  data: Partial<{ name: string; description: string | null; imageUrl: string | null; featured: boolean }>
+) {
+  const existing = await prisma.category.findUnique({ where: { id } });
+  if (!existing) throw ApiError.notFound("Category not found");
+
+  if (data.featured && !existing.featured) await assertFeaturedRoom(id);
+
+  return prisma.category.update({ where: { id }, data });
 }
 
 // categoryId is required on Product, so a category can't just be deleted out
@@ -71,6 +120,7 @@ export function createProduct(input: {
   sku: string;
   initialStock: number;
   lowStockThreshold?: number;
+  weightKg?: number;
 }) {
   return prisma.product.create({
     data: {
@@ -80,6 +130,7 @@ export function createProduct(input: {
       priceUsd: input.priceUsd,
       images: input.images,
       sku: input.sku,
+      weightKg: input.weightKg,
       stockLevel: {
         create: {
           quantityOnHand: input.initialStock,
@@ -100,6 +151,7 @@ export function updateProduct(
     priceUsd: number;
     images: string[];
     active: boolean;
+    weightKg: number | null;
   }>
   // Same trust level as createProduct — categoryId isn't pre-validated
   // against Category here either; an unknown id surfaces as the FK

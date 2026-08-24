@@ -15,6 +15,8 @@ export interface OfferInput {
   discountPercent: number;
   imageUrl?: string;
   active?: boolean;
+  startDate?: Date;
+  endDate?: Date;
 }
 
 // At most one active offer per property — enforced here rather than a DB
@@ -31,6 +33,8 @@ export async function createOffer(input: OfferInput) {
         discountPercent: input.discountPercent,
         imageUrl: input.imageUrl,
         active: input.active ?? false,
+        startDate: input.startDate,
+        endDate: input.endDate,
       },
     });
     if (offer.active) {
@@ -45,7 +49,14 @@ export async function createOffer(input: OfferInput) {
 
 export async function updateOffer(
   id: string,
-  data: Partial<{ title: string; discountPercent: number; imageUrl: string | null; active: boolean }>
+  data: Partial<{
+    title: string;
+    discountPercent: number;
+    imageUrl: string | null;
+    active: boolean;
+    startDate: Date | null;
+    endDate: Date | null;
+  }>
 ) {
   return prisma.$transaction(async (tx) => {
     const offer = await tx.offer.update({ where: { id }, data });

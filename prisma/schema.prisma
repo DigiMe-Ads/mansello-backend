@@ -1,11 +1,13 @@
 // Mansello backend — Prisma schema
 // NOTE: the Postgres exclusion constraints that guarantee no two active
-// bookings/blocks can overlap for the same property (or the same room)
-// CANNOT be expressed here. They're added by raw-SQL migrations — see
+// bookings/blocks can overlap for the same property CANNOT be expressed
+// here. They're added by raw-SQL migrations — see
 // prisma/migrations_manual/001_exclusion_constraint.sql (the original,
-// pre-rooms single constraint) and prisma/migrations/20260815000000_sri_lanka_rooms
-// (splits it into two, one whole-property-only and one same-room-only —
-// see that migration's comments for why) and SUPABASE_SETUP.md.
+// pre-rooms single constraint), prisma/migrations/20260815000000_sri_lanka_rooms
+// (temporarily split it into two, room-scoped constraints — since
+// superseded), and prisma/migrations/20260901000000_pricing_discounts_shipping
+// (current: whole-villa locking, split by bookingId instead of roomId — see
+// that migration's comments for why) and SUPABASE_SETUP.md.
 
 generator client {
   provider = "prisma-client-js"
@@ -123,6 +125,7 @@ model Property {
   adminUsers         AdminUser[]
   offers             Offer[]
   rooms              Room[]
+  rateOverrides      RateOverride[]
 }
 
 // Individually-bookable rooms (Dona's Villa) — a property with zero Room
@@ -144,8 +147,35 @@ model Room {
   updatedAt     DateTime @updatedAt
 
   availabilityBlocks AvailabilityBlock[]
+  rateOverrides      RateOverride[]
 
   @@index([propertyId, active])
+}
+
+// Seasonal/date-range price overrides — exactly one of `roomId` or
+// `(guestCount, rooms)` is set per row, matching whichever pricing model
+// the property uses (roomId for a room-based property, guestCount+rooms
+// referencing a PricingTier for a tier-based one). Resolved per night in
+// computeBookingPrice — a night whose date falls in [startDate, endDate]
+// uses this pricePerNight instead of the base rate; nights outside any
+// override use the base rate as before. See
+// BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §1.
+model RateOverride {
+  id            String   @id @default(uuid())
+  propertyId    String
+  property      Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  roomId        String?
+  room          Room?    @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  guestCount    Int?
+  rooms         Int?
+  startDate     DateTime @db.Date
+  endDate       DateTime @db.Date // inclusive
+  pricePerNight Decimal  @db.Decimal(10, 2)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([propertyId, startDate, endDate])
+  @@index([roomId])
 }
 
 model PricingTier {
@@ -163,21 +193,27 @@ model PricingTier {
 }
 
 // Unified date-range table. Every active booking (direct or Airbnb-imported)
-// has exactly one row here. The exclusion constraint lives on this table.
+// has exactly one row here. The exclusion constraints live on this table.
+//
+// Whole-villa locking (BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §3,
+// supersedes the independent-per-room-availability design
+// BACKEND_CHANGES_SRI_LANKA_ROOMS.md originally shipped): only one party
+// occupies a room-enabled property at a time, so a block on ANY room now
+// makes the WHOLE property unavailable, not just that one room — the
+// opposite of what roomId used to mean for availability purposes. roomId
+// is still recorded per block (still useful for admin display — which room
+// a block/booking is actually for) and a room-booking still creates one
+// block per reserved room, but availability is computed by ignoring roomId
+// entirely and asking "does ANY active block for this property overlap?" —
+// exactly the original, pre-rooms rule. The one new wrinkle: a single
+// booking's own several per-room blocks (same bookingId) must NOT conflict
+// with EACH OTHER even though they share the same date range — see the two
+// exclusion constraints in SUPABASE_SETUP.md for how that's expressed.
 model AvailabilityBlock {
   id          String             @id @default(uuid())
   propertyId  String
   property    Property           @relation(fields: [propertyId], references: [id], onDelete: Cascade)
-  // null = blocks every room on the property (whole-property block — what
-  // every block was before rooms existed: manual blocks, Airbnb imports,
-  // and any property with zero rooms all keep using this unchanged). Set =
-  // blocks just that one room. See modules/bookings/service.ts and
-  // modules/availability/service.ts for how overlap is actually enforced
-  // across the null/specific split — it's split across two exclusion
-  // constraints (SUPABASE_SETUP.md) plus one application-level check,
-  // not a single constraint, because Postgres has no operator for
-  // "NULL matches every value" inside an EXCLUDE.
-  roomId      String?
+  roomId      String? // which room this block is actually for — display/admin only now, not consulted for availability (see model comment)
   room        Room?              @relation(fields: [roomId], references: [id], onDelete: Cascade)
   startDate   DateTime           @db.Date
   endDate     DateTime           @db.Date
@@ -277,10 +313,13 @@ model BookingInfoRequest {
 }
 
 model Category {
-  id       String    @id @default(uuid())
-  name     String
-  slug     String    @unique
-  products Product[]
+  id          String    @id @default(uuid())
+  name        String
+  slug        String    @unique
+  description String? // short blurb for the storefront's featured section
+  imageUrl    String?
+  featured    Boolean   @default(false) // at most 4 across all categories, enforced in modules/marketplace/catalog/service.ts
+  products    Product[]
 }
 
 model Product {
@@ -293,11 +332,24 @@ model Product {
   images      String[]
   sku         String   @unique
   active      Boolean  @default(true)
+  weightKg    Decimal? @db.Decimal(10, 3) // kg per single unit; null/absent (e.g. a pre-existing product) treated as 0kg for shipping purposes
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   stockLevel StockLevel?
   orderItems OrderItem[]
+}
+
+// Small, admin-managed global table (not per-product) — a price-per-kg band
+// table used to compute an order's shippingFee from its total weight. See
+// BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4.
+model ShippingRate {
+  id         String   @id @default(uuid())
+  fromKg     Int
+  toKg       Int
+  pricePerKg Decimal  @db.Decimal(10, 2)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 }
 
 model StockLevel {
@@ -367,15 +419,23 @@ model NewsletterSubscriber {
 // class of soft business rule as turnoverBufferDays, low-stakes enough not
 // to need one.
 model Offer {
-  id              String   @id @default(uuid())
+  id              String    @id @default(uuid())
   propertyId      String
-  property        Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  property        Property  @relation(fields: [propertyId], references: [id], onDelete: Cascade)
   title           String
   discountPercent Int
   imageUrl        String?
-  active          Boolean  @default(false)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  active          Boolean   @default(false)
+  // Both nullable — null/absent on either means "no date limit," so an
+  // offer created before this field existed keeps applying whenever
+  // active: true, unchanged. When set, only nights whose date falls in
+  // [startDate, endDate] get discountPercent off at checkout; other
+  // nights of the same stay price normally. See
+  // BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §2.
+  startDate       DateTime? @db.Date
+  endDate         DateTime? @db.Date
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   @@index([propertyId])
 }

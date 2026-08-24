@@ -155,32 +155,53 @@ guaranteeing no two active rows overlap for the same property — covers
 direct bookings, Airbnb imports, and manual blocks all at once, even under
 concurrent requests, since they all live in this one table.
 
-**Superseded by two narrower constraints** once individually-bookable rooms
-existed (`prisma/migrations/20260815000000_sri_lanka_rooms` — see that
-file's comments for the full reasoning): a single constraint can't express
-"a whole-property block (`roomId IS NULL`) conflicts with every room, but
-two different rooms don't conflict with each other" — Postgres has no
-EXCLUDE operator for "NULL matches every value". Split into:
+**Temporarily split into two room-scoped constraints** once
+individually-bookable rooms existed
+(`prisma/migrations/20260815000000_sri_lanka_rooms` — kept below for
+history, since superseded below): a single constraint couldn't express "a
+whole-property block (`roomId IS NULL`) conflicts with every room, but two
+different rooms don't conflict with each other" — Postgres has no EXCLUDE
+operator for "NULL matches every value". That let different rooms be booked
+independently.
 
-1. Two whole-property blocks can't overlap (`roomId IS NULL` on both) — for
-   any property with zero rooms (The Nest Bologna) this is the exact same
-   guarantee as the original constraint, since every one of its blocks is
-   always `roomId IS NULL`. Zero behavior change for that property.
-2. Two blocks on the *same* room can't overlap (`roomId IS NOT NULL` on
-   both, plus the room id itself) — this is what stops two guests racing
-   onto the same physical room concurrently.
+**Superseded again** once that independent-per-room availability was
+reconsidered in favor of whole-villa locking — only one party occupies a
+room-enabled property at a time now, so a block on *any* room must make the
+*whole* property unavailable
+(`prisma/migrations/20260901000000_pricing_discounts_shipping` — see that
+file's comments for the full reasoning). The new rule needed: two active
+blocks for the same property, overlapping dates, conflict — *unless* they
+belong to the same booking (a room-booking creates one block per reserved
+room, all sharing one `bookingId` and, by construction, the same date
+range; those must **not** conflict with each other). Split by `bookingId`
+instead of `roomId`:
 
-The remaining case (a whole-property block landing at the same instant as a
-room-specific one) is checked at the application level instead, inside the
-same transaction as the write — see `computeBookingPrice` in
-`modules/bookings/service.ts` and `isRangeFree` in
-`modules/availability/service.ts`. Same class of accepted low-frequency
-residual risk as the `turnoverBufferDays` check and the Airbnb sync-lag
-window already documented elsewhere in this codebase — whole-property
-blocks are an infrequent, admin/import-driven write, not a high-concurrency
-guest-facing one.
+1. Both rows have a `bookingId` (a real direct/offline booking): use
+   `bookingId WITH <>` so two rows from the *same* booking are exempt, but
+   two rows from *different* bookings still conflict. Safe specifically
+   because the constraint's `WHERE` clause guarantees `bookingId IS NOT
+   NULL` on both sides — `<>` is only reliable here because there's no NULL
+   to make it ambiguous (`NULL <> NULL` is unknown, not true, which would
+   silently let two null-bookingId rows past this check).
+2. Neither row has a `bookingId` (manual blocks, Airbnb imports): plain
+   `propertyId` + daterange overlap, same as the *original* pre-rooms
+   constraint, just scoped to `bookingId IS NULL` rows. For a property with
+   zero rooms (The Nest Bologna), every block is always `bookingId`-less
+   only when it's not an actual booking — a direct booking there still gets
+   `bookingId` set (constraint 1 covers it), so this property's guarantee
+   ends up equivalent to the original single constraint either way.
 
-Both migrations need `btree_gist` (needed for a GiST index over a plain
+The remaining case (a booking's block(s) landing at the same instant as an
+existing manual/Airbnb block) is checked at the application level instead,
+inside the same transaction as the write — see `computeBookingPrice` /
+`createBookingAvailabilityBlocks` in `modules/bookings/service.ts` and
+`isRangeFree` in `modules/availability/service.ts`. Same class of accepted
+low-frequency residual risk as the `turnoverBufferDays` check and the
+Airbnb sync-lag window already documented elsewhere in this codebase —
+manual/Airbnb writes are infrequent, admin/import-driven, not
+high-concurrency guest-facing ones.
+
+All three migrations need `btree_gist` (needed for a GiST index over a plain
 equality column mixed with a range type in the same constraint), installed
 via `CREATE EXTENSION IF NOT EXISTS btree_gist` inside the migration itself
 — installs into `public`, travels with the repo. Do **not** enable it via

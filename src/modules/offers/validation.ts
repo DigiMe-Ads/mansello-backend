@@ -7,6 +7,10 @@ export const createOfferSchema = z.object({
     discountPercent: z.coerce.number().int().min(0).max(100),
     imageUrl: z.string().url().optional(),
     active: z.boolean().optional(),
+    // Both optional — omitting either means "no date limit" (applies
+    // whenever active: true, same as before this field existed).
+    startDate: z.coerce.date().optional(),
+    endDate: z.coerce.date().optional(),
   }),
 });
 
@@ -16,5 +20,7 @@ export const updateOfferSchema = z.object({
     discountPercent: z.coerce.number().int().min(0).max(100).optional(),
     imageUrl: z.string().url().nullable().optional(),
     active: z.boolean().optional(),
+    startDate: z.coerce.date().nullable().optional(),
+    endDate: z.coerce.date().nullable().optional(),
   }),
 });

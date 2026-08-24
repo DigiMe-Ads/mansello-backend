@@ -12,6 +12,7 @@ import bookingsRoutes from "@/modules/bookings/routes";
 import { italyWebhookRouter, sriLankaWebhookRouter } from "@/modules/payments/webhooks";
 import catalogRoutes from "@/modules/marketplace/catalog/routes";
 import ordersRoutes from "@/modules/marketplace/orders/routes";
+import shippingRatesRoutes from "@/modules/marketplace/shipping/routes";
 import leadsRoutes from "@/modules/leads/routes";
 import adminAuthRoutes from "@/modules/admin/routes";
 import offersRoutes from "@/modules/offers/routes";
@@ -23,6 +24,7 @@ import {
   publicRoutes as bookingInfoPublicRoutes,
 } from "@/modules/guestInfo/routes";
 import { propertyRoomsRoutes, roomRoutes } from "@/modules/rooms/routes";
+import { propertyRateOverrideRoutes, rateOverrideRoutes } from "@/modules/rateOverrides/routes";
 
 export function createApp() {
   const app = express();
@@ -47,6 +49,10 @@ export function createApp() {
   // (see modules/rooms/routes.ts) so that module stays self-contained.
   app.use("/api/properties", propertyRoomsRoutes);
   app.use("/api/rooms", roomRoutes);
+  // Adds /:propertyId/rate-overrides on top of the routes above — a
+  // separate router (see modules/rateOverrides/routes.ts).
+  app.use("/api/properties", propertyRateOverrideRoutes);
+  app.use("/api/rate-overrides", rateOverrideRoutes);
   app.use("/api/availability", availabilityRoutes);
   app.use("/api/bookings", bookingsRoutes);
   // Adds /:id/info-requests on top of the routes above — a separate router
@@ -54,6 +60,7 @@ export function createApp() {
   app.use("/api/bookings", bookingInfoRequestRoutes);
   app.use("/api/marketplace/catalog", catalogRoutes);
   app.use("/api/marketplace/orders", ordersRoutes);
+  app.use("/api/marketplace/shipping-rates", shippingRatesRoutes);
   app.use("/api/leads", leadsRoutes);
   app.use("/api/admin", adminAuthRoutes);
   app.use("/api/admin/guest-info-template", guestInfoTemplateRoutes);

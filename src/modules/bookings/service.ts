@@ -27,21 +27,26 @@ export interface CityTaxBand {
   ratePerPersonPerNight: number;
 }
 
-// Guests under cityTaxExemptAgeUnder pay nothing; a stay longer than
-// cityTaxMaxNights only accrues tax for the first cityTaxMaxNights nights —
-// the room price itself is unaffected by that cap, only the tax stops.
-function computeCityTax(
-  property: { cityTaxEnabled: boolean; cityTaxMaxNights: number; cityTaxExemptAgeUnder: number; cityTaxBands: unknown },
-  pricePerNight: number,
-  nights: number,
+// Guests under cityTaxExemptAgeUnder pay nothing. Computed per night now
+// (BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §1) since a RateOverride
+// can make the underlying rate vary night to night — the caller sums this
+// across nights and stops calling it once cityTaxMaxNights of the stay have
+// been taxed (the room price itself is unaffected by that cap, only the tax
+// stops). `nightPrice` is the resolved, post-RateOverride, pre-discount
+// price for that one night — tax bands off the underlying rate, not what
+// the guest actually ends up charged after a promotional discount, same
+// reasoning already applied to totalPriceOverride in createOfflineBooking
+// below.
+function computeCityTaxForNight(
+  property: { cityTaxEnabled: boolean; cityTaxExemptAgeUnder: number; cityTaxBands: unknown },
+  nightPrice: number,
   guests: number,
   childrenUnder14: number
 ): number {
   if (!property.cityTaxEnabled) return 0;
 
   const taxableGuests = Math.max(0, guests - Math.min(childrenUnder14, guests));
-  const taxedNights = Math.min(nights, property.cityTaxMaxNights);
-  const pricePerPersonPerNight = pricePerNight / guests;
+  const pricePerPersonPerNight = nightPrice / guests;
 
   const bands = property.cityTaxBands as CityTaxBand[];
   const band = bands.find(
@@ -50,7 +55,56 @@ function computeCityTax(
       (b.maxPricePerPersonPerNight === null || pricePerPersonPerNight <= b.maxPricePerPersonPerNight)
   );
 
-  return band ? taxableGuests * taxedNights * band.ratePerPersonPerNight : 0;
+  return band ? taxableGuests * band.ratePerPersonPerNight : 0;
+}
+
+function nightlyDates(checkIn: Date, nights: number): Date[] {
+  const dates: Date[] = [];
+  for (let i = 0; i < nights; i++) dates.push(new Date(checkIn.getTime() + i * MS_PER_DAY));
+  return dates;
+}
+
+// RateOverride.endDate is inclusive (admin picks a range like a normal date
+// field), unlike AvailabilityBlock's half-open [start, end) convention.
+function coversDate(start: Date, end: Date, date: Date): boolean {
+  return start.getTime() <= date.getTime() && date.getTime() <= end.getTime();
+}
+
+type RateOverrideRow = Awaited<ReturnType<typeof prisma.rateOverride.findMany>>[number];
+
+function resolveRoomNightlyPrice(room: { id: string; pricePerNight: Prisma.Decimal }, overrides: RateOverrideRow[], date: Date): number {
+  const match = overrides.find((o) => o.roomId === room.id && coversDate(o.startDate, o.endDate, date));
+  return match ? Number(match.pricePerNight) : Number(room.pricePerNight);
+}
+
+function resolveTierNightlyPrice(
+  guestCount: number,
+  rooms: number,
+  basePricePerNight: number,
+  overrides: RateOverrideRow[],
+  date: Date
+): number {
+  const match = overrides.find(
+    (o) => o.guestCount === guestCount && o.rooms === rooms && coversDate(o.startDate, o.endDate, date)
+  );
+  return match ? Number(match.pricePerNight) : basePricePerNight;
+}
+
+// Highest matching active offer's % for this one night — offers don't
+// stack (BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §2). An offer with
+// no date range (or only one of startDate/endDate set — shouldn't happen
+// given they're set/cleared together, but treated the same defensively as
+// "no limit" rather than never matching) covers every night.
+function resolveNightlyDiscountPercent(
+  offers: { discountPercent: number; startDate: Date | null; endDate: Date | null }[],
+  date: Date
+): number {
+  let highest = 0;
+  for (const offer of offers) {
+    const covers = !offer.startDate || !offer.endDate ? true : coversDate(offer.startDate, offer.endDate, date);
+    if (covers && offer.discountPercent > highest) highest = offer.discountPercent;
+  }
+  return highest;
 }
 
 // The price a guest pays is never taken from the request. For a property
@@ -111,9 +165,10 @@ export async function computeBookingPrice(
   }
 
   const activeRoomCount = await prisma.room.count({ where: { propertyId, active: true } });
+  const nightDates = nightlyDates(checkIn, nights);
 
-  let pricePerNight: number;
   let selectedRooms: Awaited<ReturnType<typeof prisma.room.findMany>> = [];
+  let nightlyBasePrices: number[]; // post-RateOverride, pre-discount — one entry per night
 
   if (activeRoomCount > 0) {
     // Room-booking property — roomIds is how the guest picks, not a count.
@@ -135,9 +190,22 @@ export async function computeBookingPrice(
         `The selected room(s) sleep ${totalCapacity} — select more rooms for a party of ${guests}`
       );
     }
-    pricePerNight = selectedRooms.reduce((sum, r) => sum + Number(r.pricePerNight), 0);
+
+    // Broad overlap fetch (one query for the whole stay) — exact per-night
+    // matching happens in memory via resolveRoomNightlyPrice below.
+    const roomOverrides = await prisma.rateOverride.findMany({
+      where: {
+        propertyId,
+        roomId: { in: selectedRooms.map((r) => r.id) },
+        startDate: { lte: checkOut },
+        endDate: { gte: checkIn },
+      },
+    });
+    nightlyBasePrices = nightDates.map((date) =>
+      selectedRooms.reduce((sum, room) => sum + resolveRoomNightlyPrice(room, roomOverrides, date), 0)
+    );
   } else {
-    // Non-room property — unchanged PricingTier lookup.
+    // Non-room property — unchanged PricingTier lookup, now with per-night overrides.
     if (roomIds && roomIds.length > 0) {
       throw ApiError.badRequest("This property doesn't book by individual room");
     }
@@ -147,15 +215,43 @@ export async function computeBookingPrice(
     if (!tier) {
       throw ApiError.badRequest(`No price is configured for ${guests} guest(s) in ${rooms} room(s) at this property`);
     }
-    pricePerNight = Number(tier.pricePerNight);
+    const basePricePerNight = Number(tier.pricePerNight);
+
+    const tierOverrides = await prisma.rateOverride.findMany({
+      where: {
+        propertyId,
+        guestCount: guests,
+        rooms,
+        startDate: { lte: checkOut },
+        endDate: { gte: checkIn },
+      },
+    });
+    nightlyBasePrices = nightDates.map((date) =>
+      resolveTierNightlyPrice(guests, rooms, basePricePerNight, tierOverrides, date)
+    );
   }
 
-  const accommodationPrice = pricePerNight * nights;
-  // Composes the same way regardless of source — tax is banded off the
-  // underlying pricePerNight either way, whether that's one tier's price or
-  // several rooms' summed rate. Moot for Dona's Villa today (cityTaxEnabled
-  // is Bologna-only) but stays correct if that ever changes.
-  const cityTax = computeCityTax(property, pricePerNight, nights, guests, childrenUnder14);
+  // Date-scoped discounts (BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md
+  // §2) — resolved per night, on top of whatever RateOverride already
+  // applied for that night.
+  const activeOffers = await prisma.offer.findMany({ where: { propertyId, active: true } });
+
+  let accommodationPrice = 0;
+  let cityTax = 0;
+  for (let i = 0; i < nights; i++) {
+    const nightBasePrice = nightlyBasePrices[i]; // post-override, pre-discount — the "underlying rate"
+    const discountPercent = resolveNightlyDiscountPercent(activeOffers, nightDates[i]);
+    accommodationPrice += nightBasePrice * (1 - discountPercent / 100);
+
+    // City tax bands off the underlying rate (post-override), not what the
+    // guest actually ends up charged after a discount — same reasoning as
+    // totalPriceOverride's cityTax handling in createOfflineBooking below —
+    // and only for the first cityTaxMaxNights of the stay.
+    if (i < property.cityTaxMaxNights) {
+      cityTax += computeCityTaxForNight(property, nightBasePrice, guests, childrenUnder14);
+    }
+  }
+  const pricePerNight = nights > 0 ? accommodationPrice / nights : 0; // average actually-charged nightly rate, informational
 
   return {
     property,
@@ -186,19 +282,26 @@ export interface CreatePendingBookingInput {
 
 // Creates the AvailabilityBlock row(s) for a booking inside its transaction
 // — one whole-property block (roomId null) for a non-room booking, exactly
-// as before, or one block per reserved room for a room-booking. Either way
-// relies on the DB exclusion constraints (SUPABASE_SETUP.md) to guarantee,
-// even under concurrency, that the insert(s) fail if a same-scope block
-// already covers these dates — the outer try/catch in each caller below
-// translates that into a clean 409.
+// as before, or one block per reserved room for a room-booking (still one
+// row per room for admin visibility, even though whole-villa locking below
+// means any one of them blocks the entire property).
 //
-// The one case those constraints can't express — a whole-property block
-// already covering these dates for a room-booking — is checked here
-// explicitly before the per-room inserts, via the same tx client so it sees
-// anything already written earlier in this same transaction. This is a
-// narrow, low-frequency residual race (whole-property blocks are an
-// infrequent admin/Airbnb-import write, not a high-concurrency guest-facing
-// one) — same accepted-risk class as the turnoverBufferDays check above.
+// Whole-villa locking (BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §3,
+// supersedes the independent-per-room-availability design
+// BACKEND_CHANGES_SRI_LANKA_ROOMS.md originally shipped): only one party
+// occupies the property at a time, so this booking's block(s) must not
+// overlap ANY other active block for the property, regardless of room.
+// Two DIFFERENT bookings conflicting is caught by the DB exclusion
+// constraint on INSERT (bookingId <>, see SUPABASE_SETUP.md) via the outer
+// try/catch in each caller below — that constraint is specifically built to
+// exempt this booking's own several per-room blocks (same bookingId) from
+// conflicting with EACH OTHER while still catching every other booking.
+// The one case it can't express — an existing manual/Airbnb block
+// (bookingId IS NULL) — is checked explicitly here, via the same tx client
+// so it sees anything already written earlier in this same transaction.
+// Narrow, low-frequency residual race (manual/Airbnb writes are infrequent
+// admin/import actions, not high-concurrency guest-facing ones) — same
+// accepted-risk class as the turnoverBufferDays check above.
 async function createBookingAvailabilityBlocks(
   tx: Prisma.TransactionClient,
   propertyId: string,
@@ -207,6 +310,19 @@ async function createBookingAvailabilityBlocks(
   checkOut: Date,
   rooms: { id: string }[]
 ) {
+  const nonBookingBlock = await tx.availabilityBlock.findFirst({
+    where: {
+      propertyId,
+      bookingId: null,
+      status: "active",
+      startDate: { lt: checkOut },
+      endDate: { gt: checkIn },
+    },
+  });
+  if (nonBookingBlock) {
+    throw ApiError.conflict("These dates are no longer available for this property.");
+  }
+
   if (rooms.length === 0) {
     await tx.availabilityBlock.create({
       data: {
@@ -219,19 +335,6 @@ async function createBookingAvailabilityBlocks(
       },
     });
     return;
-  }
-
-  const wholePropertyBlock = await tx.availabilityBlock.findFirst({
-    where: {
-      propertyId,
-      roomId: null,
-      status: "active",
-      startDate: { lt: checkOut },
-      endDate: { gt: checkIn },
-    },
-  });
-  if (wholePropertyBlock) {
-    throw ApiError.conflict("These dates are no longer available for this property.");
   }
 
   for (const room of rooms) {

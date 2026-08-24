@@ -11,6 +11,10 @@ export async function createCategory(req: Request, res: Response) {
   res.status(201).json(await service.createCategory(req.body));
 }
 
+export async function updateCategory(req: Request, res: Response) {
+  res.json(await service.updateCategory(req.params.id, req.body));
+}
+
 export async function deleteCategory(req: Request, res: Response) {
   await service.deleteCategory(req.params.id);
   res.status(204).send();

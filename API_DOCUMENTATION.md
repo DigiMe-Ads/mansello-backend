@@ -16,17 +16,27 @@ Roles: `super_admin` (everything), `villa_manager` (scoped to one `propertyId`),
 Every blocked date range for a property — whether it's a direct booking, an
 Airbnb-imported block, or a manual admin block — lives in one table:
 `availability_blocks` (`source`: `direct` | `airbnb` | `manual`), each row
-optionally scoped to one `Room` (`room_id`, nullable — see §3). Two Postgres
-**exclusion constraints** make it physically impossible for two active rows
-to conflict, enforced by the database itself so it holds even under
-concurrent requests, not just at the application layer: one guarantees no
-two whole-property blocks (`room_id IS NULL`) overlap, the other guarantees
-no two blocks on the *same* room overlap — different rooms at the same
-property don't conflict with each other. (For a property with no rooms
-configured — The Nest Bologna — every block is always `room_id IS NULL`, so
-this is exactly the single-constraint behavior this system always had.) The
-one case a database constraint can't express — a whole-property block
-landing at the same instant as a room-specific one — is checked at the
+optionally scoped to one `Room` (`room_id`, nullable — see §3). **Whole-villa
+locking**: only one party occupies a room-enabled property (Dona's Villa) at
+a time, so a block on *any* room now makes the *whole* property unavailable
+— booking one room blocks the other two as well, not just the one reserved.
+`room_id` is still recorded per block (useful for admin display — which
+room a block/booking is actually for) but isn't consulted when computing
+availability. (A property with no rooms configured — The Nest Bologna —
+already only ever books as a single unit, so this is a no-op there.)
+
+Two Postgres **exclusion constraints** make it physically impossible for
+two active rows to conflict, enforced by the database itself so it holds
+even under concurrent requests, not just at the application layer: one
+guarantees two rows belonging to *different* bookings never overlap
+(`bookingId <>`, only comparable when both are set), the other guarantees
+two rows with *no* booking (manual blocks, Airbnb imports) never overlap.
+The exemption that makes room-booking possible in the first place — a
+single booking's own several per-room blocks, which share one `bookingId`
+and the same date range, must *not* conflict with each other — falls out of
+using `bookingId` rather than `roomId` as the differentiator. The one case
+a database constraint can't express — a booking's block(s) landing at the
+same instant as an existing manual/Airbnb block — is checked at the
 application level instead, inside the same transaction as the write; see
 `SUPABASE_SETUP.md` for the exact SQL and the full reasoning.
 
@@ -107,40 +117,68 @@ price still is), `cityTaxExemptAgeUnder` (default `14`), and `cityTaxBands`
 (`{ minPricePerPersonPerNight, maxPricePerPersonPerNight: number | null,
 ratePerPersonPerNight }[]`, sorted ascending, `null` max = the top band).
 Set via `prisma/seed.ts`, not through `PATCH /api/properties/:propertyId` —
-there's no admin UI for editing these yet. See §5 for how they turn into an
+there's no admin UI for editing these yet. See §6 for how they turn into an
 actual charge on a booking.
 
 ## 3. Rooms — `/api/properties/:propertyId/rooms`, `/api/rooms`
 
 Individually-bookable rooms (Dona's Villa) — a guest picks specific room(s)
-instead of just a room *count*, availability and pricing are per-room, and
-everything here is fully admin-configurable (no hardcoded room names/photos
-anywhere). **Additive and optional**: a property with zero `Room` rows
-(The Nest Bologna) keeps booking as a single unit via `PricingTier` exactly
-as it always has — nothing below applies to it. See
-`BACKEND_CHANGES_SRI_LANKA_ROOMS.md` for the full design.
+instead of just a room *count*, pricing is per-room (§6), and everything
+here is fully admin-configurable (no hardcoded room names/photos anywhere).
+**Additive and optional**: a property with zero `Room` rows (The Nest
+Bologna) keeps booking as a single unit via `PricingTier` exactly as it
+always has — nothing below applies to it. Availability, on the other hand,
+is whole-property even for a room-enabled property — booking any room(s)
+blocks the other rooms too, see §1.1 and §5 — so "individually-bookable"
+here means *which room*, not *independent availability per room*. See
+`BACKEND_CHANGES_SRI_LANKA_ROOMS.md` for the original design and
+`BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md` §3 for the whole-villa-
+locking reversal on top of it.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/properties/:propertyId/rooms` | public, or super_admin/`villa_manager` scoped to this property with a token | Active rooms, sorted by `sortOrder`. `?includeInactive=true` also returns retired (`active: false`) rooms — only honored with a valid admin token scoped to this property, silently ignored (falls back to active-only) otherwise. Same branch-on-token pattern as blog's `GET /api/blog/posts` (§11) |
+| GET | `/api/properties/:propertyId/rooms` | public, or super_admin/`villa_manager` scoped to this property with a token | Active rooms, sorted by `sortOrder`. `?includeInactive=true` also returns retired (`active: false`) rooms — only honored with a valid admin token scoped to this property, silently ignored (falls back to active-only) otherwise. Same branch-on-token pattern as blog's `GET /api/blog/posts` (§12) |
 | POST | `/api/properties/:propertyId/rooms` | super_admin, `villa_manager` (own property) | Body: `{ name, subtitle?, capacity, pricePerNight, images?, sortOrder? }`. `201` with the created `Room`. `images` are uploaded first through the existing shared upload flow (`POST /api/uploads/images`), same as products/offers/blog — this endpoint just takes the resulting URLs |
 | PATCH | `/api/rooms/:roomId` | super_admin, `villa_manager` (own property) | Partial update: any subset of `{ name, subtitle, capacity, pricePerNight, images, sortOrder, active }`. Setting `active: false` retires a room — hides it from the public list and blocks new bookings against it, without touching any booking that already references it |
 | DELETE | `/api/rooms/:roomId` | super_admin, `villa_manager` (own property) | `404` if it doesn't exist. `409` if any non-cancelled booking's `roomIds` still references it — deactivate instead (`PATCH { active: false }`), same "can't delete, has history" guard used elsewhere in this API (e.g. marketplace products) |
 
-## 4. Availability — `/api/availability`
+## 4. Rate overrides — `/api/properties/:propertyId/rate-overrides`, `/api/rate-overrides`
+
+Seasonal/date-range price overrides — an admin sets a different nightly
+rate for a specific date or date range without touching the base rate that
+applies everywhere else. Guests never see a calendar of these, only the
+resolved price for whatever dates they've actually picked — see §6 for
+exactly how a night's price gets resolved. See
+`BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md` §1 for the full design.
+
+Exactly one of `roomId` or `(guestCount, rooms)` is set per row, matching
+whichever pricing model the property uses — `roomId` for a room-based
+property (Dona's Villa), `(guestCount, rooms)` referencing an existing
+`PricingTier` for a tier-based one (The Nest Bologna). `endDate` is
+inclusive (unlike `AvailabilityBlock`'s half-open range) — an admin picks a
+range like a normal date field.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/properties/:propertyId/rate-overrides` | public | All of the property's rate overrides, sorted by `startDate` |
+| POST | `/api/properties/:propertyId/rate-overrides` | super_admin, `villa_manager` (own property) | Body: `{ roomId?, guestCount?, rooms?, startDate, endDate, pricePerNight }`. `400` if neither or both of `roomId`/`(guestCount, rooms)` are set, if `roomId` doesn't belong to this property, or if `(guestCount, rooms)` doesn't match an existing `PricingTier` on this property. `201` with the created row |
+| PATCH | `/api/rate-overrides/:id` | super_admin, `villa_manager` (own property) | Any subset of the create fields. Re-validates the same rules as create against the merged (existing + patch) result — a `PATCH` that only changes `pricePerNight` still has to resolve to a valid target |
+| DELETE | `/api/rate-overrides/:id` | super_admin, `villa_manager` (own property) | Hard delete — no history concern here (unlike rooms/products), an override is just a price rule, not something referenced by past bookings |
+
+## 5. Availability — `/api/availability`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/availability/:propertyId?from=YYYY-MM-DD&to=YYYY-MM-DD` | public | Active blocks (direct + Airbnb + manual) for the read-only calendar. Each block includes `roomId` — `null` for a whole-property block, set for one scoped to a single room (§3) |
-| POST | `/api/availability/:propertyId/blocks` | super_admin, villa_manager (own property) | Manual block. Body: `{ "startDate", "endDate", "reason"?, "roomId"? }` — omit `roomId` for today's whole-property behavior, unchanged; set it to block just that one room (e.g. for maintenance) instead. `409` if it overlaps an existing block — a whole-property block conflicts with every room's blocks and vice versa, two different rooms don't conflict with each other |
+| POST | `/api/availability/:propertyId/blocks` | super_admin, villa_manager (own property) | Manual block. Body: `{ "startDate", "endDate", "reason"?, "roomId"? }` — `roomId` is recorded (which room a maintenance block is "for", shown in the admin Blocks tab) but doesn't change what it actually blocks: whole-villa locking (§1.1) means any block, room-specific or not, makes the *entire* property unavailable for those dates. `409` if it overlaps *any* existing active block on the property, regardless of room |
 | DELETE | `/api/availability/blocks/:blockId` | super_admin, villa_manager | Release a manual block |
 | GET | `/ical/:icalExportToken.ics` | public (unguessable token) | Our export feed — paste into Airbnb's "Import Calendar" field |
 
-## 5. Bookings — `/api/bookings`
+## 6. Bookings — `/api/bookings`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms?, childrenUnder14?, roomIds? }`. Price is always computed server-side, never taken from the request, and branches on whether the property has any `Room` rows configured (§3): **with** rooms (Dona's Villa) — `roomIds` is required (non-empty), every id must belong to this property and be active, their combined `capacity` must cover `guests`, and price is `nights × Σ(each room's pricePerNight)`; `rooms` is derived from `roomIds.length` server-side, not trusted from the client. **Without** rooms (The Nest Bologna) — unchanged: `rooms` defaults to 1, price comes from the `PricingTier` table, `400` if no tier is configured for that guest/room combo, and `roomIds` must be omitted (`400` if sent). `childrenUnder14` defaults to 0 and `400`s if it exceeds `guests`, same either way. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates (or, for a room-booking, any of the selected rooms) just got taken |
+| POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms?, childrenUnder14?, roomIds? }`. Price is always computed server-side, never taken from the request, **per night** (see below), and branches on whether the property has any `Room` rows configured (§3): **with** rooms (Dona's Villa) — `roomIds` is required (non-empty), every id must belong to this property and be active, their combined `capacity` must cover `guests`; `rooms` is derived from `roomIds.length` server-side, not trusted from the client. **Without** rooms (The Nest Bologna) — unchanged: `rooms` defaults to 1, `400` if no `PricingTier` is configured for that guest/room combo, and `roomIds` must be omitted (`400` if sent). `childrenUnder14` defaults to 0 and `400`s if it exceeds `guests`, same either way. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates (or, for a room-booking, the whole property — see §1.1) just got taken |
 | GET | `/api/bookings/:id` | public | Booking status (poll after Stripe confirmation, or for a "my booking" page) |
 | GET | `/api/bookings/property/:propertyId?status=` | super_admin, villa_manager (own property) | List bookings, optional status filter |
 | POST | `/api/bookings/offline` | super_admin, villa_manager (own property) | Manual/phone/walk-in booking — same body as above (including the room-booking branch), no Stripe. Created as `paid_offline`. Optional `totalPriceOverride` for a negotiated rate (this overrides `accommodationPrice` only — city tax, when the property has it, is still computed from the standard rate and added on top, since it's a pass-through municipal fee, not part of the negotiated room price); otherwise priced the same way as a direct booking |
@@ -148,6 +186,29 @@ as it always has — nothing below applies to it. See
 
 `booking.status`: `pending_payment` → `confirmed` (via webhook) or `cancelled`
 (expired hold) — or `paid_offline` for manual admin bookings.
+
+**Pricing is resolved per night**, not as `nights × one flat rate` — each
+night of the stay independently resolves to a price, and those are summed:
+
+1. Start from the base rate for that night — a room's own `pricePerNight`
+   (room-booking) or the matched `PricingTier.pricePerNight` (tier-based).
+2. If a `RateOverride` (§4) for that room (or that `guestCount`/`rooms`
+   pair) covers that night's date, its `pricePerNight` replaces the base
+   rate for that one night only.
+3. If any `active: true` `Offer` (§11) for the property — with no date
+   range, or a date range covering that night — matches, the *highest*
+   matching `discountPercent` is taken off that night's price (post-step-2,
+   pre-discount rate); offers don't stack.
+4. City tax, when `cityTaxEnabled`, is banded per night off the step-2
+   result (post-`RateOverride`, *pre*-discount) — a promotional discount
+   doesn't change what the comune considers the underlying rate, same
+   reasoning already applied to `totalPriceOverride` below.
+
+`accommodationPrice` is the sum of every night's step-3 result;
+`totalPrice = accommodationPrice + cityTax`, same as always. A property
+with no `RateOverride`/`Offer` rows configured resolves to exactly the old
+flat-rate behavior for every night — this is additive, not a rewrite of
+what an unconfigured property already does.
 
 **Price breakdown, for properties with `cityTaxEnabled`** (currently just
 The Nest Bologna): every `Booking` carries `accommodationPrice` (pure room
@@ -164,7 +225,7 @@ rate, not whatever any one guest ends up charged), guests under
 `cityTaxMaxNights` stop accruing tax (the room price for those nights is
 still charged in full).
 
-## 6. Payments (webhooks only — no public endpoints)
+## 7. Payments (webhooks only — no public endpoints)
 
 | Method | Path | Description |
 |---|---|---|
@@ -174,32 +235,49 @@ still charged in full).
 Register both endpoints in each Stripe dashboard, subscribed to at least
 `payment_intent.succeeded` and `payment_intent.payment_failed`.
 
-## 7. Marketplace catalog — `/api/marketplace/catalog`
+## 8. Marketplace catalog — `/api/marketplace/catalog`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/marketplace/catalog/categories` | public | List categories |
-| POST | `/api/marketplace/catalog/categories` | super_admin, marketplace_manager | Body: `{ name, slug? }` — `slug` is derived from `name` if omitted. `409` if the slug already exists |
+| GET | `/api/marketplace/catalog/categories` | public | List every category — no filtering on `featured`, this is also what the full marketplace product listing's category filter uses. Includes `description`, `imageUrl`, `featured` |
+| POST | `/api/marketplace/catalog/categories` | super_admin, marketplace_manager | Body: `{ name, slug?, description?, imageUrl?, featured? }` — `slug` is derived from `name` if omitted. `409` if the slug already exists, or if this would put more than 4 categories at `featured: true` at once |
+| PATCH | `/api/marketplace/catalog/categories/:id` | super_admin, marketplace_manager | Any subset of `{ name, description, imageUrl, featured }`. `404` if it doesn't exist, `409` on the same 4-featured-max rule as create (re-saving a category that's already one of the 4 doesn't count against itself) |
 | DELETE | `/api/marketplace/catalog/categories/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it still has any products — delete or move them first, no cascade |
-| GET | `/api/marketplace/catalog/products?category=slug` | public, or super_admin/marketplace_manager with a token | **Without** a valid admin token: active products only (the storefront). **With** a `super_admin`/`marketplace_manager` token: inactive products included too. Same path/handler either way — branches on whether the request carried a valid token, same pattern as blog's `GET /api/blog/posts` (§11). `?category=` filter applies in both cases |
+| GET | `/api/marketplace/catalog/products?category=slug` | public, or super_admin/marketplace_manager with a token | **Without** a valid admin token: active products only (the storefront). **With** a `super_admin`/`marketplace_manager` token: inactive products included too. Same path/handler either way — branches on whether the request carried a valid token, same pattern as blog's `GET /api/blog/posts` (§12). `?category=` filter applies in both cases |
 | GET | `/api/marketplace/catalog/products/:id` | public, or super_admin/marketplace_manager with a token | Single product. Same admin branch as the list above — an inactive product `404`s without a valid admin token |
-| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §14.9, new code should use that instead |
-| POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold? }` |
-| PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `categoryId`, `name`, `description`, `priceUsd`, `images`, `active` — `categoryId` lets a product move to a different category, e.g. to empty one out before deleting it |
+| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §15.9, new code should use that instead |
+| POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold?, weightKg? }` — `weightKg` (kg per single unit) feeds shipping-fee calculation (§9); omitted/absent is treated as 0kg |
+| PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `categoryId`, `name`, `description`, `priceUsd`, `images`, `active`, `weightKg` — `categoryId` lets a product move to a different category, e.g. to empty one out before deleting it |
 | DELETE | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it has any order history (real orders reference it) — deactivate instead (`PATCH { active: false }`), which already hides it from the storefront without touching order records. A never-ordered product deletes cleanly, its stock row goes with it |
 | POST | `/api/marketplace/catalog/products/:id/stock-adjustment` | super_admin, marketplace_manager | Body: `{ delta }` (positive = restock, negative = manual removal) |
 | GET | `/api/marketplace/catalog/low-stock` | super_admin, marketplace_manager | Products at/below their `lowStockThreshold` |
 
-## 8. Marketplace orders — `/api/marketplace/orders`
+## 9. Marketplace orders & shipping — `/api/marketplace/orders`, `/api/marketplace/shipping-rates`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/marketplace/orders` | public | Guest COD checkout. Body: `{ customerName, customerPhone, deliveryAddress, notes?, shippingFee, items: [{ productId, quantity }] }` |
+| POST | `/api/marketplace/orders` | public | Guest COD checkout. Body: `{ customerName, customerPhone, deliveryAddress, notes?, items: [{ productId, quantity }] }`. `shippingFee` is **computed server-side** from the items' weight and the current `ShippingRate` table (below) — never taken from the request (closes a gap `BACKEND_PLAN.md` §7 left open, where it used to be a flat, client-supplied value; a `shippingFee` in the request body is now silently ignored) |
 | GET | `/api/marketplace/orders/:id` | public | Order status lookup |
 | GET | `/api/marketplace/orders?status=` | super_admin, marketplace_manager | List orders, optional status filter |
 | PATCH | `/api/marketplace/orders/:id/status` | super_admin, marketplace_manager | Body: `{ status }`. Valid transitions enforced server-side (see §1.5) |
+| GET | `/api/marketplace/shipping-rates` | public | List the current price-per-kg bands (`{ fromKg, toKg, pricePerKg }[]`), sorted by `fromKg` — checkout needs to price shipping before the customer has any session |
+| PUT | `/api/marketplace/shipping-rates` | super_admin, marketplace_manager | Body: `{ rates: [{ fromKg, toKg, pricePerKg }, ...] }` — **bulk replace** (delete-all-then-recreate in one transaction, not an upsert — rows have no natural stable identity to upsert against, since an admin reconfiguring the bands can freely change how many exist and where they start/end). Returns the full new list |
 
-## 9. Leads — `/api/leads`
+**Shipping fee calculation**: `totalWeightKg = Σ(product.weightKg × quantity)`
+across the order's items (a product with no `weightKg` set counts as 0kg),
+rounded **up** to the nearest whole kg, minimum 1kg once the cart is
+non-empty (even an all-0kg cart still gets charged the 1kg band). Find the
+`ShippingRate` row where `fromKg <= totalWeightKg <= toKg`; the fee is
+`totalWeightKg × that row's pricePerKg` — the *whole* weight at that one
+band's rate, not a blend across bands. If the rounded weight exceeds every
+row's `toKg`, the highest row's `pricePerKg` prices the excess (symmetrically,
+a weight below every row's `fromKg` uses the lowest row's rate) — there's no
+data to price it any other way until the admin adds more rows. If no
+`ShippingRate` rows are configured at all, the fee is `0` rather than
+silently trusting a client-sent value (the trust gap being closed above) or
+guessing at a fallback constant.
+
+## 10. Leads — `/api/leads`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -212,23 +290,36 @@ Register both endpoints in each Stripe dashboard, subscribed to at least
 | POST | `/api/leads/newsletter` | public | Body: `{ email, site: "italy"|"sri_lanka" }`. `201` on success, `409` if that email is already subscribed *for that site* (subscribing to both sites independently is fine — same email, different `site`, no conflict) |
 | GET | `/api/leads/newsletter?site=` | any admin role | List subscribers, optional site filter |
 
-## 10. Offers — `/api/offers`
+## 11. Offers — `/api/offers`
 
 Per-property discount banners — replaces what used to be a hardcoded "48% OFF"
-card on both homepages. The frontend fetches all offers for a property and
-shows whichever one has `active: true`. At most one offer per property can be
+card on both homepages, and (once an `active` offer has a date range —
+below) actually reduces the accommodation price at checkout too, not just a
+marketing card. The frontend fetches all offers for a property and shows
+whichever one has `active: true`. At most one offer per property can be
 `active` at a time — creating or updating one with `active: true` silently
 deactivates any other active offer for that same property (transactional, so
 a concurrent request can't observe two active offers even momentarily).
 
+`startDate`/`endDate` (both nullable, always set/cleared together): omitted
+on either means "no date limit," so an `active` offer applies to every
+night of every stay, same as before this field existed. When set, only
+matches a night whose date falls within `[startDate, endDate]` when
+resolving the per-night discount (§6) — a stay with nights outside that
+range gets the discount only on the nights that fall inside it. **Because
+at most one offer can be `active` per property, only one offer's discount
+can ever actually apply at once in practice today** — the "highest
+matching %" resolution logic in §6 exists for when that changes, not
+because it currently does anything with more than one row.
+
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/offers?propertyId=` | public | List offers for one property. `400` if `propertyId` is omitted |
-| POST | `/api/offers` | super_admin, villa_manager (own property) | Body: `{ propertyId, title, discountPercent, imageUrl?, active? }` |
-| PATCH | `/api/offers/:id` | super_admin, villa_manager (own property) | Partial update — also how the Activate/Deactivate toggle works (`{ active: boolean }`). Which property an offer belongs to is resolved server-side from the offer itself (not the URL), so a villa_manager gets `403` on another property's offer even though `propertyId` isn't in this route |
+| POST | `/api/offers` | super_admin, villa_manager (own property) | Body: `{ propertyId, title, discountPercent, imageUrl?, active?, startDate?, endDate? }` |
+| PATCH | `/api/offers/:id` | super_admin, villa_manager (own property) | Partial update — also how the Activate/Deactivate toggle works (`{ active: boolean }`), and how `startDate`/`endDate` get set or cleared (send `null` to clear either back to "no date limit"). Which property an offer belongs to is resolved server-side from the offer itself (not the URL), so a villa_manager gets `403` on another property's offer even though `propertyId` isn't in this route |
 | DELETE | `/api/offers/:id` | super_admin, villa_manager (own property) | Same scoping as `PATCH` |
 
-## 11. Blog — `/api/blog`
+## 12. Blog — `/api/blog`
 
 Per-site posts (an Italy post never appears on the Sri Lanka site), admin-authored,
 draft/publish workflow via `publishedAt`.
@@ -245,7 +336,7 @@ Only `super_admin` manages blog content — posts aren't cleanly scoped to one
 property or the marketplace the way `villa_manager`/`marketplace_manager`
 are, so this is deliberately not role-split further for now.
 
-## 12. Admin — `/api/admin`
+## 13. Admin — `/api/admin`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -257,7 +348,7 @@ are, so this is deliberately not role-split further for now.
 | GET | `/api/admin/users` | super_admin | List all admin accounts (`id, email, role, propertyScopeId, createdAt` — never `passwordHash`) |
 | DELETE | `/api/admin/users/:id` | super_admin | Remove an admin account. `400` if you try to delete the account you're currently authenticated as (avoids stranding your own session with no other super_admin to undo it); `404` if the id doesn't exist. No "last super_admin" guard — it's possible to delete every super_admin account, so be deliberate |
 
-## 13. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
+## 14. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
 
 Lets an admin send a booked guest a link, by email, to a short form
 collecting whatever extra info is needed before their stay (passport number,
@@ -291,15 +382,15 @@ not by a background job, so nothing needs to run for it to be accurate.
 No customer accounts, no sessions — knowing the token *is* the access
 control, same trust model as `Property.icalExportToken` elsewhere in this
 API. Uploaded documents go to the same S3/R2 bucket as `/api/uploads/images`
-(§14.9), under a `guest-documents/` prefix.
+(§15.9), under a `guest-documents/` prefix.
 
 ---
 
-## 14. Frontend integration checklist
+## 15. Frontend integration checklist
 
 Things a frontend needs to know that aren't obvious from the endpoint list above.
 
-### 14.1 Stripe publishable keys — not provided by this API
+### 15.1 Stripe publishable keys — not provided by this API
 
 This backend only ever holds Stripe **secret** keys, server-side
 (`STRIPE_ITALY_SECRET_KEY` / `STRIPE_SRILANKA_SECRET_KEY`). To initialize
@@ -314,7 +405,7 @@ publishable/secret key pair (frontend using the wrong account's key) fails
 with a "No such payment_intent" error client-side — the two keys must come
 from the *same* Stripe account.
 
-### 14.2 Confirming payment — use the Payment Element, and pass a `return_url`
+### 15.2 Confirming payment — use the Payment Element, and pass a `return_url`
 
 PaymentIntents are created with `automatic_payment_methods: { enabled: true }`
 (default `allow_redirects: "always"`), so each one's `payment_method_types`
@@ -329,7 +420,7 @@ Dashboard (restrict enabled payment methods) or ask for a backend change to
 set `allow_redirects: "never"` in `payments/service.ts` — not something to
 work around purely in the frontend.
 
-### 14.3 Booking confirmation is asynchronous — poll after `confirmPayment`
+### 15.3 Booking confirmation is asynchronous — poll after `confirmPayment`
 
 `stripe.confirmPayment()` resolving successfully in the browser does **not**
 mean `booking.status` is `confirmed` yet — that only happens once Stripe's
@@ -340,7 +431,7 @@ poll `GET /api/bookings/:id` (e.g. every 1–2s, give up after ~15s) until
 timeout there most likely means the webhook is just running slightly behind,
 not that anything failed — word the UI accordingly rather than showing an error.
 
-### 14.4 The hold has a countdown — show it, and handle expiry gracefully
+### 15.4 The hold has a countdown — show it, and handle expiry gracefully
 
 `POST /api/bookings` returns `booking.expiresAt` (15 minutes out by default,
 `BOOKING_HOLD_MINUTES`). If checkout isn't completed by then, a cron job
@@ -350,7 +441,7 @@ the next poll). Show a visible countdown during checkout, and if payment
 fails after the hold appears to have expired, message it as "your hold
 expired, please start again" rather than a generic payment error.
 
-### 14.5 Two different "room" concepts — check `property.rooms` first
+### 15.5 Two different "room" concepts — check `property.rooms` first
 
 Check `GET /api/properties/:slug`'s `rooms` array (§3) before deciding which
 picker to render — it's non-empty only for a property that's been
@@ -364,10 +455,13 @@ Nest Bologna).
   `rooms`) on `POST /api/bookings` — one entry per selected room, their
   combined `capacity` must cover `guests` (`400` otherwise, show that
   message directly), and price is derived server-side from the selected
-  rooms' own rates. Availability is per-room: use `GET
-  /api/availability/:propertyId`'s per-block `roomId` (§4) to compute which
-  specific rooms are free for a candidate date range, not just whether the
-  property as a whole has anything booked.
+  rooms' own rates. **Availability is whole-property, not per-room** (§1.1,
+  reversed from the original per-room design once whole-villa locking
+  shipped): booking any room(s) blocks every room for those dates, so a
+  candidate date range is either free for the whole property or it isn't —
+  `GET /api/availability/:propertyId`'s per-block `roomId` is informational
+  (which room a block is "for," for admin display) and shouldn't be used to
+  compute per-room availability on the guest-facing calendar.
 - **`property.rooms` is empty**: unchanged, older behavior — `guests` +
   `rooms` (optional, defaults to `1`) together select the exact
   `PricingTier` row from `property.pricingTiers` (`{ guestCount, rooms,
@@ -380,21 +474,21 @@ Either way: never compute or send a price yourself — the server always
 derives `totalPrice` itself, from whichever of the two mechanisms applies
 to that property.
 
-### 14.6 Currency is per-property
+### 15.6 Currency is per-property
 
 `property.currency` is `"eur"` for The Nest Bologna and `"usd"` for Dona's
 Villa — format guest-facing prices accordingly (`€` vs `$`), don't hardcode
 one currency site-wide. `Booking.currency` in every booking response always
 matches `property.currency`.
 
-### 14.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
+### 15.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
 
 `checkIn`/`checkOut` are stored as dates only, no time component. Sending a
 full ISO datetime risks the calendar date shifting by a day once converted to
 UTC (e.g. a late-evening Sri Lanka timestamp rolling into the next UTC day).
 Always send plain date strings, e.g. `"2026-08-01"`.
 
-### 14.8 CORS
+### 15.8 CORS
 
 `CORS_ORIGIN` in the backend's `.env` must exactly match the frontend's
 origin (`src/app.ts` → `cors({ origin: env.corsOrigin })`, currently only a
@@ -402,7 +496,7 @@ single origin string, no allowlist). Defaults to `http://localhost:3000` for
 local dev — update it before deploying if the production frontend domain
 differs.
 
-### 14.9 Image upload
+### 15.9 Image upload
 
 `POST /api/uploads/images` is the one shared upload endpoint — used by the
 product catalog, offers, and blog alike. It proxies the upload through this
@@ -448,7 +542,7 @@ feature-specific upload routes going forward.
 
 ---
 
-## 15. Error shape
+## 16. Error shape
 
 ```json
 { "error": "date_conflict", "message": "These dates are no longer available for this property." }
@@ -459,7 +553,7 @@ Validation errors (Zod) return `400` with
 — `path` is dot-joined, prefixed with `body`/`query`/`params` per where the
 field lives in the request.
 
-## 16. Not yet wired (see BACKEND_PLAN.md for context)
+## 17. Not yet wired (see BACKEND_PLAN.md for context)
 
 - WhatsApp transfer confirmations (currently a manual admin action, per plan §11)
 - Government ID-export endpoint for Italy/Sri Lanka compliance filing (data is captured on `Booking`, export route not yet built)

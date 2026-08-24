@@ -5,16 +5,17 @@ export function listProperties() {
   return prisma.property.findMany({ include: { pricingTiers: true } });
 }
 
-// Includes active rooms (sorted for display) alongside pricingTiers, so the
-// public site gets them for free with no extra request — empty array for a
-// property with none (The Nest Bologna), same no-op-by-default shape as
-// every other room-related addition.
+// Includes active rooms and all rateOverrides alongside pricingTiers, so the
+// public site gets them for free with no extra request — empty arrays for a
+// property with none, same no-op-by-default shape as every other
+// room/pricing addition.
 export function getPropertyBySlug(slug: string) {
   return prisma.property.findUnique({
     where: { slug },
     include: {
       pricingTiers: true,
       rooms: { where: { active: true }, orderBy: { sortOrder: "asc" } },
+      rateOverrides: true,
     },
   });
 }

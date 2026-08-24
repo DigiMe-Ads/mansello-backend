@@ -12,33 +12,26 @@ export function listBlocksForProperty(propertyId: string, from?: string, to?: st
   });
 }
 
-// Runs the same check the DB exclusion constraints enforce, so the API can
-// return a friendly 409 before even attempting the insert. The constraints
-// themselves (see SUPABASE_SETUP.md) are the real source of truth under
-// concurrency for same-room and same-whole-property overlaps; the one case
-// they can't express — a whole-property block vs. a room-specific one — is
-// only checked here (see that doc section for why), which is why this
-// function is also called inline inside the booking transaction for a
-// room-booking, not just from the manual-block endpoint.
-//
-// roomId omitted/undefined = checking a whole-property block: conflicts
-// with ANY active block for the property, room-specific or not, since a
-// whole-property block blocks every room. roomId given = checking one
-// room: conflicts with a block on that same room, or a whole-property
-// block (roomId IS NULL blocks every room), but not a different room.
-export async function isRangeFree(
-  propertyId: string,
-  startDate: Date,
-  endDate: Date,
-  roomId?: string
-) {
+// Whole-villa locking (BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §3,
+// supersedes the independent-per-room-availability design
+// BACKEND_CHANGES_SRI_LANKA_ROOMS.md originally shipped): only one party
+// occupies the property at a time, so this deliberately ignores roomId —
+// ANY active block for the property overlapping the range makes it
+// unavailable, room-specific or not. Runs the same check the DB exclusion
+// constraints enforce, so the API can return a friendly 409 before even
+// attempting the insert. The constraints themselves (SUPABASE_SETUP.md) are
+// the real source of truth under concurrency for two DIFFERENT bookings
+// conflicting; the one case they can't express — a booking's block(s)
+// vs. an existing bookingId-less (manual/Airbnb) block — is only checked
+// here, which is why this function is also called inline inside the
+// booking transaction, not just from the manual-block endpoint.
+export async function isRangeFree(propertyId: string, startDate: Date, endDate: Date) {
   const overlapping = await prisma.availabilityBlock.findFirst({
     where: {
       propertyId,
       status: "active",
       startDate: { lt: endDate },
       endDate: { gt: startDate },
-      ...(roomId ? { OR: [{ roomId: null }, { roomId }] } : {}),
     },
   });
   return !overlapping;
@@ -49,9 +42,14 @@ export async function createManualBlock(input: {
   startDate: Date;
   endDate: Date;
   reason?: string;
-  roomId?: string; // omit for today's whole-property behavior, unchanged
+  // Still accepted and stored (which specific room a maintenance block is
+  // "for", shown in the admin Blocks tab) but no longer consulted for the
+  // availability check itself — any block, room-specific or not, now locks
+  // the whole property. Omit for the same whole-property block this always
+  // created.
+  roomId?: string;
 }) {
-  if (!(await isRangeFree(input.propertyId, input.startDate, input.endDate, input.roomId))) {
+  if (!(await isRangeFree(input.propertyId, input.startDate, input.endDate))) {
     throw ApiError.conflict("Dates overlap an existing block or booking");
   }
   return prisma.availabilityBlock.create({
