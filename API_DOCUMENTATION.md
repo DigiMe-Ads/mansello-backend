@@ -245,7 +245,7 @@ Register both endpoints in each Stripe dashboard, subscribed to at least
 | DELETE | `/api/marketplace/catalog/categories/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it still has any products — delete or move them first, no cascade |
 | GET | `/api/marketplace/catalog/products?category=slug` | public, or super_admin/marketplace_manager with a token | **Without** a valid admin token: active products only (the storefront). **With** a `super_admin`/`marketplace_manager` token: inactive products included too. Same path/handler either way — branches on whether the request carried a valid token, same pattern as blog's `GET /api/blog/posts` (§12). `?category=` filter applies in both cases |
 | GET | `/api/marketplace/catalog/products/:id` | public, or super_admin/marketplace_manager with a token | Single product. Same admin branch as the list above — an inactive product `404`s without a valid admin token |
-| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §15.9, new code should use that instead |
+| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §16.9, new code should use that instead |
 | POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold?, weightKg? }` — `weightKg` (kg per single unit) feeds shipping-fee calculation (§9); omitted/absent is treated as 0kg |
 | PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `categoryId`, `name`, `description`, `priceUsd`, `images`, `active`, `weightKg` — `categoryId` lets a product move to a different category, e.g. to empty one out before deleting it |
 | DELETE | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it has any order history (real orders reference it) — deactivate instead (`PATCH { active: false }`), which already hides it from the storefront without touching order records. A never-ordered product deletes cleanly, its stock row goes with it |
@@ -382,15 +382,41 @@ not by a background job, so nothing needs to run for it to be accurate.
 No customer accounts, no sessions — knowing the token *is* the access
 control, same trust model as `Property.icalExportToken` elsewhere in this
 API. Uploaded documents go to the same S3/R2 bucket as `/api/uploads/images`
-(§15.9), under a `guest-documents/` prefix.
+(§16.9), under a `guest-documents/` prefix.
 
 ---
 
-## 15. Frontend integration checklist
+## 15. Analytics / click heatmaps — `/api/analytics`
+
+A Plerdy/Hotjar-style click heatmap: a collector on every public page (never
+`/admin/*`) beacons each click's normalized position back here; the admin
+"Heatmap" tab (`super_admin` only) renders the target page in an iframe with
+a canvas heat overlay built from the aggregated result. See
+`BACKEND_CHANGES_HEATMAP_ANALYTICS.md` for the full design, including the
+raw `ClickEvent` schema.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/analytics/click-events` | public, rate-limited (300/min/IP) | High-volume, fire-and-forget ingest — hit directly by every visitor's browser (`sendBeacon`/`fetch`, not `authedFetch`), never `authedFetch`'d. Body: `{ events: [{ site?, path, xPct, yPct, viewportWidth, device, sessionId, targetSelector?, occurredAt }] }`, up to 50 events per request (extra ones are silently truncated, not rejected). `xPct`/`yPct` are clamped server-side to `[0, 1]` regardless of what the client sends. **Always responds `202`**, even for a malformed event, an over-the-rate-limit request, or a request whose `Origin`/`Referer` doesn't match this site's own domains — a real visitor's browser must never see an error here, and there's nothing it could do about one anyway. A rejected/malformed event is just silently not recorded, never surfaced |
+| GET | `/api/analytics/heatmap?path=&device=&from=&to=` | `super_admin` | `path` required; `device` is `all` (default) \| `desktop` \| `tablet` \| `mobile`; `from`/`to` are `YYYY-MM-DD`, inclusive on both ends. Aggregates `ClickEvent` rows at read time (no separate rollup table — traffic here doesn't warrant one yet) into a 100×100 grid (`xPct`/`yPct` rounded to 2 decimals) matching the resolution the frontend's canvas renderer expects. Returns `{ site, path, device, from, to, totalClicks, totalPageViews, maxWeight, points: [{ xPct, yPct, weight }] }` — `totalPageViews` is `count(distinct sessionId)` in range (a "page view" here means a distinct visiting session, not a separate pageview-tracking system), `maxWeight` is the highest single point's weight, for the frontend to normalize color/opacity against |
+| GET | `/api/analytics/heatmap/pages?site=` | `super_admin` | Every distinct `path` seen so far (optionally filtered to one `site`), with an all-time, all-device click count — purely cosmetic, annotates the admin page-picker dropdown. `{ site, path, label, clicks }[]`, `label` just echoes `path` |
+
+`ClickEvent` rows are deleted once they're older than **180 days** by a
+daily cron job (`src/jobs/clickEventRetention.ts`) — raw rows are only ever
+read in aggregate and nothing on the frontend requests a range past 90 days,
+so 180 gives headroom without keeping data indefinitely. No visitor-
+identifying data is collected today (`sessionId` is a random per-tab id, not
+an account or fingerprint) — if that ever changes, keep it out of anything
+the admin dashboard reads back, and check it against this site's privacy
+policy pages first.
+
+---
+
+## 16. Frontend integration checklist
 
 Things a frontend needs to know that aren't obvious from the endpoint list above.
 
-### 15.1 Stripe publishable keys — not provided by this API
+### 16.1 Stripe publishable keys — not provided by this API
 
 This backend only ever holds Stripe **secret** keys, server-side
 (`STRIPE_ITALY_SECRET_KEY` / `STRIPE_SRILANKA_SECRET_KEY`). To initialize
@@ -405,7 +431,7 @@ publishable/secret key pair (frontend using the wrong account's key) fails
 with a "No such payment_intent" error client-side — the two keys must come
 from the *same* Stripe account.
 
-### 15.2 Confirming payment — use the Payment Element, and pass a `return_url`
+### 16.2 Confirming payment — use the Payment Element, and pass a `return_url`
 
 PaymentIntents are created with `automatic_payment_methods: { enabled: true }`
 (default `allow_redirects: "always"`), so each one's `payment_method_types`
@@ -420,7 +446,7 @@ Dashboard (restrict enabled payment methods) or ask for a backend change to
 set `allow_redirects: "never"` in `payments/service.ts` — not something to
 work around purely in the frontend.
 
-### 15.3 Booking confirmation is asynchronous — poll after `confirmPayment`
+### 16.3 Booking confirmation is asynchronous — poll after `confirmPayment`
 
 `stripe.confirmPayment()` resolving successfully in the browser does **not**
 mean `booking.status` is `confirmed` yet — that only happens once Stripe's
@@ -431,7 +457,7 @@ poll `GET /api/bookings/:id` (e.g. every 1–2s, give up after ~15s) until
 timeout there most likely means the webhook is just running slightly behind,
 not that anything failed — word the UI accordingly rather than showing an error.
 
-### 15.4 The hold has a countdown — show it, and handle expiry gracefully
+### 16.4 The hold has a countdown — show it, and handle expiry gracefully
 
 `POST /api/bookings` returns `booking.expiresAt` (15 minutes out by default,
 `BOOKING_HOLD_MINUTES`). If checkout isn't completed by then, a cron job
@@ -441,7 +467,7 @@ the next poll). Show a visible countdown during checkout, and if payment
 fails after the hold appears to have expired, message it as "your hold
 expired, please start again" rather than a generic payment error.
 
-### 15.5 Two different "room" concepts — check `property.rooms` first
+### 16.5 Two different "room" concepts — check `property.rooms` first
 
 Check `GET /api/properties/:slug`'s `rooms` array (§3) before deciding which
 picker to render — it's non-empty only for a property that's been
@@ -474,21 +500,21 @@ Either way: never compute or send a price yourself — the server always
 derives `totalPrice` itself, from whichever of the two mechanisms applies
 to that property.
 
-### 15.6 Currency is per-property
+### 16.6 Currency is per-property
 
 `property.currency` is `"eur"` for The Nest Bologna and `"usd"` for Dona's
 Villa — format guest-facing prices accordingly (`€` vs `$`), don't hardcode
 one currency site-wide. `Booking.currency` in every booking response always
 matches `property.currency`.
 
-### 15.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
+### 16.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
 
 `checkIn`/`checkOut` are stored as dates only, no time component. Sending a
 full ISO datetime risks the calendar date shifting by a day once converted to
 UTC (e.g. a late-evening Sri Lanka timestamp rolling into the next UTC day).
 Always send plain date strings, e.g. `"2026-08-01"`.
 
-### 15.8 CORS
+### 16.8 CORS
 
 `CORS_ORIGIN` in the backend's `.env` must exactly match the frontend's
 origin (`src/app.ts` → `cors({ origin: env.corsOrigin })`, currently only a
@@ -496,7 +522,7 @@ single origin string, no allowlist). Defaults to `http://localhost:3000` for
 local dev — update it before deploying if the production frontend domain
 differs.
 
-### 15.9 Image upload
+### 16.9 Image upload
 
 `POST /api/uploads/images` is the one shared upload endpoint — used by the
 product catalog, offers, and blog alike. It proxies the upload through this
@@ -542,7 +568,7 @@ feature-specific upload routes going forward.
 
 ---
 
-## 16. Error shape
+## 17. Error shape
 
 ```json
 { "error": "date_conflict", "message": "These dates are no longer available for this property." }
@@ -553,7 +579,7 @@ Validation errors (Zod) return `400` with
 — `path` is dot-joined, prefixed with `body`/`query`/`params` per where the
 field lives in the request.
 
-## 17. Not yet wired (see BACKEND_PLAN.md for context)
+## 18. Not yet wired (see BACKEND_PLAN.md for context)
 
 - WhatsApp transfer confirmations (currently a manual admin action, per plan §11)
 - Government ID-export endpoint for Italy/Sri Lanka compliance filing (data is captured on `Booking`, export route not yet built)

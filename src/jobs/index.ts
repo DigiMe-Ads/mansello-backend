@@ -3,6 +3,7 @@ import { env } from "@/config/env";
 import { syncAirbnbCalendars } from "./airbnbSync";
 import { runBookingExpiryJob } from "./bookingExpiry";
 import { runLowStockAlertJob } from "./lowStockAlert";
+import { runClickEventRetentionJob } from "./clickEventRetention";
 
 export function startJobs() {
   // Airbnb typically refreshes imported calendars roughly hourly on their
@@ -24,5 +25,14 @@ export function startJobs() {
     runLowStockAlertJob(adminEmail).catch((err) => console.error("Low-stock alert job failed:", err));
   });
 
-  console.log("Scheduled jobs started (airbnb sync, booking expiry, low-stock alert)");
+  // Once a day — click_events is high-volume and only ever read in
+  // aggregate; nothing on the frontend assumes rows live past the 90-day
+  // range it offers, so 180 gives headroom without keeping data forever.
+  cron.schedule("0 4 * * *", () => {
+    runClickEventRetentionJob().catch((err) => console.error("Click-event retention job failed:", err));
+  });
+
+  console.log(
+    "Scheduled jobs started (airbnb sync, booking expiry, low-stock alert, click-event retention)"
+  );
 }

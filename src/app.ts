@@ -25,9 +25,18 @@ import {
 } from "@/modules/guestInfo/routes";
 import { propertyRoomsRoutes, roomRoutes } from "@/modules/rooms/routes";
 import { propertyRateOverrideRoutes, rateOverrideRoutes } from "@/modules/rateOverrides/routes";
+import analyticsRoutes from "@/modules/analytics/routes";
 
 export function createApp() {
   const app = express();
+
+  // Railway (and any reverse proxy) sits in front of this app — without
+  // this, req.ip is the proxy's own address for every request, which would
+  // make the click-events rate limiter (modules/analytics/routes.ts) see
+  // all traffic as one IP and either never trigger or trigger for
+  // everyone at once. `1` trusts exactly one hop (the platform's edge),
+  // matching Railway's setup.
+  app.set("trust proxy", 1);
 
   app.use(helmet());
   app.use(cors({ origin: env.corsOrigin }));
@@ -68,6 +77,7 @@ export function createApp() {
   app.use("/api/blog", blogRoutes);
   app.use("/api/uploads", uploadsRoutes);
   app.use("/api/booking-info-requests", bookingInfoPublicRoutes);
+  app.use("/api/analytics", analyticsRoutes);
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);

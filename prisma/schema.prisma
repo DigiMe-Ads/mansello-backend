@@ -88,6 +88,12 @@ enum AdminRole {
   marketplace_manager
 }
 
+enum ClickDevice {
+  desktop
+  tablet
+  mobile
+}
+
 model Property {
   id                    String           @id @default(uuid())
   slug                  String           @unique // "the-nest-bologna" | "donas-villa"
@@ -465,4 +471,31 @@ model AdminUser {
   propertyScope   Property? @relation(fields: [propertyScopeId], references: [id])
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+}
+
+// Raw, high-volume click-heatmap data — not tied to Property/Booking/etc.,
+// just a page path and a normalized click position. No relations
+// deliberately: this table needs to stay cheap to insert into (public,
+// unauthenticated, up to 50 rows per beacon) and is only ever read back in
+// aggregate (modules/analytics/service.ts), never joined against anything
+// else. `BigInt` autoincrement id rather than this schema's usual
+// `String @default(uuid())` — a real, deliberate departure for exactly
+// this one high-volume table, not a stray inconsistency; see
+// BACKEND_CHANGES_HEATMAP_ANALYTICS.md. No visitor-identifying data
+// (`sessionId` is a random per-tab id, not an account or fingerprint) — see
+// that doc before adding any (IP, user agent, etc.).
+model ClickEvent {
+  id             BigInt      @id @default(autoincrement())
+  site           Site? // null for pages not under /italy or /sri-lanka (e.g. a shared homepage)
+  path           String // e.g. "/sri-lanka/airbnb"
+  xPct           Float       @db.Real // 0–1, fraction of page width at click time — resolution-independent, never raw pixels
+  yPct           Float       @db.Real // 0–1, fraction of page height, against scrollHeight
+  viewportWidth  Int
+  device         ClickDevice // coarse bucket computed client-side from window.innerWidth, matches the admin preview iframe's virtual widths
+  sessionId      String // random UUID in sessionStorage — resets every tab/session, exists only to count distinct "page views" apart from raw click volume
+  targetSelector String? // best-effort "tag#id.class" — informational only
+  occurredAt     DateTime // client-reported click time
+  createdAt      DateTime    @default(now()) // server receive time
+
+  @@index([path, device, occurredAt])
 }
