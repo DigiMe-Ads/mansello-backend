@@ -4,6 +4,7 @@ import Stripe from "stripe";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { getStripeClient, getWebhookSecret } from "./stripeClients";
 import * as bookings from "@/modules/bookings/service";
+import * as orders from "@/modules/marketplace/orders/service";
 import { sendBookingConfirmation } from "@/modules/notifications/email";
 
 function makeWebhookRouter(accountRef: "italy" | "sri_lanka") {
@@ -31,6 +32,25 @@ function makeWebhookRouter(accountRef: "italy" | "sri_lanka") {
       switch (event.type) {
         case "payment_intent.succeeded": {
           const intent = event.data.object as Stripe.PaymentIntent;
+          // Metadata always carries `type` for a PaymentIntent created after
+          // BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md (see
+          // modules/payments/service.ts createPaymentIntent); missing/anything
+          // else falls back to the booking branch, which is what every
+          // PaymentIntent created before that change looks like.
+          if (intent.metadata?.type === "marketplace_order") {
+            const result = await orders.confirmOrderByPaymentIntent(intent.id);
+            if (result.count === 0) {
+              // Duplicate webhook delivery, or the order was cancelled
+              // (e.g. by the stale-pending cleanup job) before payment landed.
+              console.warn(
+                `[stripe:${accountRef}] payment_intent.succeeded for ${intent.id} matched no pending marketplace order (already confirmed or cancelled)`
+              );
+              break;
+            }
+            console.log(`[stripe:${accountRef}] confirmed marketplace order for PaymentIntent ${intent.id}`);
+            break;
+          }
+
           const result = await bookings.confirmBooking(intent.id);
           if (result.count === 0) {
             // Either already confirmed (duplicate delivery — Stripe retries webhooks) or

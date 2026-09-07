@@ -57,7 +57,7 @@ export async function createOrder(input: {
       customerPhone: input.customerPhone,
       deliveryAddress: input.deliveryAddress,
       notes: input.notes,
-      paymentMethod: "cod",
+      paymentMethod: "card",
       shippingFee,
       subtotal,
       total,
@@ -66,6 +66,27 @@ export async function createOrder(input: {
     },
     include: { items: true },
   });
+}
+
+// Mirrors modules/bookings/service.ts's attachPaymentIntent/getBookingByPaymentIntent
+// pair — see BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md.
+export function attachPaymentIntent(orderId: string, stripePaymentIntentId: string) {
+  return prisma.order.update({ where: { id: orderId }, data: { stripePaymentIntentId } });
+}
+
+export function getOrderByPaymentIntent(stripePaymentIntentId: string) {
+  return prisma.order.findFirst({ where: { stripePaymentIntentId }, include: { items: true } });
+}
+
+// Called when the order row was created but Stripe PaymentIntent creation
+// then failed, before the guest ever received a clientSecret — mirrors
+// bookings' releasePendingBooking. Unlike a booking hold, a pending order
+// doesn't reserve anything real yet (stock isn't decremented until
+// confirmOrder runs), so there's no availability to free — just marks the
+// otherwise-unpayable order cancelled instead of leaving a ghost "pending"
+// row in the admin dashboard forever.
+export async function releaseUnpaidOrder(orderId: string) {
+  await prisma.order.updateMany({ where: { id: orderId, status: "pending" }, data: { status: "cancelled" } });
 }
 
 export function listOrders(status?: string) {
@@ -80,9 +101,12 @@ export function getOrder(id: string) {
   return prisma.order.findUnique({ where: { id }, include: { items: true } });
 }
 
-// Admin confirms after phoning/verifying the order — this is the point stock
-// actually leaves inventory for a COD storefront (no payment capture event
-// to hang it off of instead).
+// This is the point stock actually leaves inventory. Before
+// BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md it only ran when an admin phoned/
+// verified a COD order; now it's normally driven by confirmOrderByPaymentIntent
+// below (Stripe webhook, payment succeeded), and this stays reachable
+// directly via PATCH /:id/status as a manual admin recovery path (e.g. the
+// webhook was missed but Stripe's dashboard shows the charge went through).
 export async function confirmOrder(orderId: string) {
   const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true } });
   if (order.status !== "pending") throw ApiError.badRequest("Only pending orders can be confirmed");
@@ -96,6 +120,24 @@ export async function confirmOrder(orderId: string) {
     }
     return tx.order.update({ where: { id: orderId }, data: { status: "confirmed" } });
   });
+}
+
+// Called from the Stripe webhook (payment_intent.succeeded) — mirrors
+// bookings' confirmBooking(stripePaymentIntentId). Looks the order up by
+// PaymentIntent id rather than trusting metadata.orderId alone, and reuses
+// confirmOrder's transaction (decrement stock, mark confirmed) so there's
+// only one place that logic lives. Returns { count: 0 } for a duplicate
+// webhook delivery or a PaymentIntent that doesn't match any pending order
+// (already confirmed, or the order was cancelled first) — same shape as
+// confirmBooking's updateMany result, for the same reason: nothing to do,
+// not an error.
+export async function confirmOrderByPaymentIntent(stripePaymentIntentId: string) {
+  const order = await prisma.order.findFirst({
+    where: { stripePaymentIntentId, status: "pending" },
+  });
+  if (!order) return { count: 0 };
+  await confirmOrder(order.id);
+  return { count: 1 };
 }
 
 const VALID_TRANSITIONS: Record<string, string[]> = {
@@ -131,4 +173,30 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
     }
     return tx.order.update({ where: { id: orderId }, data: { status: nextStatus as never } });
   });
+}
+
+// Cancels orders left "pending" (payment never completed — abandoned
+// checkout, card declined and the customer left) past a generous window.
+// Unlike a booking's pending_payment hold, nothing here blocks real
+// inventory in the meantime (stock isn't decremented until confirmOrder
+// runs), so this is just dashboard hygiene, not correctness-critical — a
+// daily job is enough, no need for bookings' every-minute cadence. See
+// BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md point 4.
+//
+// Scoped to paymentMethod: "card" ONLY — a pre-existing "cod" order sitting
+// in "pending" means something entirely different (the old COD flow: an
+// order genuinely awaiting a staff phone call, which can legitimately sit
+// there for a long time) and must never be auto-cancelled by this job. This
+// was caught live: an early version without this filter auto-cancelled 3
+// real, weeks-old "cod" pending orders in production during testing before
+// this job was ever wired into cron — see the closing summary for
+// BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md/TESTIMONIALS.md for the incident
+// and how it was reverted.
+export async function expireStalePendingOrders(olderThanHours = 24) {
+  const cutoff = new Date(Date.now() - olderThanHours * 60 * 60 * 1000);
+  const result = await prisma.order.updateMany({
+    where: { status: "pending", paymentMethod: "card", createdAt: { lt: cutoff } },
+    data: { status: "cancelled" },
+  });
+  return result.count;
 }

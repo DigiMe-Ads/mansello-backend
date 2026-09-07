@@ -30,7 +30,7 @@ export async function startBooking(req: Request, res: Response) {
       property.stripeAccountRef as StripeAccountRef,
       Number(booking.totalPrice),
       booking.currency,
-      booking.id
+      { type: "booking", bookingId: booking.id }
     );
   } catch (err) {
     // The hold (booking + AvailabilityBlock) already exists at this point —

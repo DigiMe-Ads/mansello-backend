@@ -4,6 +4,7 @@ import { syncAirbnbCalendars } from "./airbnbSync";
 import { runBookingExpiryJob } from "./bookingExpiry";
 import { runLowStockAlertJob } from "./lowStockAlert";
 import { runClickEventRetentionJob } from "./clickEventRetention";
+import { runOrderExpiryJob } from "./orderExpiry";
 
 export function startJobs() {
   // Airbnb typically refreshes imported calendars roughly hourly on their
@@ -32,7 +33,13 @@ export function startJobs() {
     runClickEventRetentionJob().catch((err) => console.error("Click-event retention job failed:", err));
   });
 
+  // Once a day — see runOrderExpiryJob/expireStalePendingOrders for why this
+  // doesn't need bookingExpiry's every-minute cadence.
+  cron.schedule("0 5 * * *", () => {
+    runOrderExpiryJob().catch((err) => console.error("Order expiry job failed:", err));
+  });
+
   console.log(
-    "Scheduled jobs started (airbnb sync, booking expiry, low-stock alert, click-event retention)"
+    "Scheduled jobs started (airbnb sync, booking expiry, low-stock alert, click-event retention, order expiry)"
   );
 }

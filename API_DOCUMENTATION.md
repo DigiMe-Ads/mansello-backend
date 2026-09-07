@@ -85,17 +85,49 @@ verified against its own signing secret:
 - `POST /webhooks/stripe/italy`
 - `POST /webhooks/stripe/sri-lanka`
 
-### 1.5 Marketplace COD order lifecycle
+### 1.5 Marketplace order lifecycle
 
 `pending → confirmed → packed → shipped → delivered`, with `cancelled` /
-`returned` reachable from most states. Stock is decremented at `confirmed`
-(when admin has actually verified the order by phone), not at `pending`, so
-an abandoned cart never ties up inventory. Cancelling/returning a
-`confirmed`-or-later order restocks automatically. Each `OrderItem` snapshots
-`productNameSnapshot` / `unitPriceSnapshot` at order time, so historical
-orders stay accurate even if product prices change later. A customer phone
-number with 3+ `cancelled`/`returned` orders gets new orders auto-flagged
-(`flaggedForReview: true`) for the admin queue — not blocked.
+`returned` reachable from most states. As of
+`BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md`, checkout is card-paid up front —
+mirroring §1.2's direct-booking-hold flow — not cash-on-delivery:
+
+1. Guest checks out → `POST /api/marketplace/orders` creates the `Order`
+   (`status = pending`) and, in the same request, a Stripe `PaymentIntent`
+   on the `sri_lanka` account (the marketplace's only account — it has no
+   Stripe account of its own), returning `{ order, clientSecret }`.
+2. The Stripe webhook (`payment_intent.succeeded`, same two endpoints as
+   §1.4 — routed by the PaymentIntent's `metadata.type`, `"booking"` vs.
+   `"marketplace_order"`) flips the order to `confirmed` **and decrements
+   stock** — this is the point stock actually leaves inventory now,
+   replacing what used to be a staff phone-verification step. An abandoned
+   (never-paid) cart never ties up inventory, same guarantee as before.
+3. `PATCH /api/marketplace/orders/:id/status` still accepts a manual
+   `pending → confirmed` transition as an admin recovery path (webhook
+   missed but the charge genuinely succeeded) — but it verifies the
+   PaymentIntent's status against Stripe first and `400`s if it isn't
+   actually `succeeded`, so this can't be used to confirm (and decrement
+   stock for) an order nobody paid for.
+4. Cancelling/returning an order that was ever paid (anything past
+   `pending`) refunds the full `total` through Stripe to the original
+   payment method, reusing the same `refundPaymentIntent` villa bookings
+   use (§1.2). A `pending` (never-paid) order cancelled directly triggers
+   no refund. A Stripe-side refund failure is logged, not surfaced as a
+   failed request — the order's status change already committed by then.
+5. A daily job (`src/jobs/orderExpiry.ts`) auto-cancels orders still
+   `pending` after 24h — but **only** ones with `paymentMethod: "card"`.
+   Older `"cod"` rows (pre-dating this change) can legitimately sit
+   `pending` for a long time awaiting staff action under the old flow and
+   must never be swept by this job; an early version without that
+   `paymentMethod` filter briefly auto-cancelled 3 real production `"cod"`
+   orders during testing before this job was ever wired into cron — caught
+   immediately, reverted, and the filter added before this shipped.
+
+Each `OrderItem` snapshots `productNameSnapshot` / `unitPriceSnapshot` at
+order time, so historical orders stay accurate even if product prices change
+later. A customer phone number with 3+ `cancelled`/`returned` orders gets
+new orders auto-flagged (`flaggedForReview: true`) for the admin queue — not
+blocked.
 
 ---
 
@@ -235,6 +267,14 @@ still charged in full).
 Register both endpoints in each Stripe dashboard, subscribed to at least
 `payment_intent.succeeded` and `payment_intent.payment_failed`.
 
+`sri-lanka`'s webhook confirms both Dona's Villa bookings and marketplace
+orders (the marketplace has no Stripe account of its own — see §1.5) —
+`payment_intent.succeeded` routes by the PaymentIntent's `metadata.type`
+(`"booking"` vs. `"marketplace_order"`, set at creation in
+`modules/payments/service.ts createPaymentIntent`); anything else (or
+missing, matching every PaymentIntent created before
+`BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md`) falls back to the booking branch.
+
 ## 8. Marketplace catalog — `/api/marketplace/catalog`
 
 | Method | Path | Auth | Description |
@@ -245,7 +285,7 @@ Register both endpoints in each Stripe dashboard, subscribed to at least
 | DELETE | `/api/marketplace/catalog/categories/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it still has any products — delete or move them first, no cascade |
 | GET | `/api/marketplace/catalog/products?category=slug` | public, or super_admin/marketplace_manager with a token | **Without** a valid admin token: active products only (the storefront). **With** a `super_admin`/`marketplace_manager` token: inactive products included too. Same path/handler either way — branches on whether the request carried a valid token, same pattern as blog's `GET /api/blog/posts` (§12). `?category=` filter applies in both cases |
 | GET | `/api/marketplace/catalog/products/:id` | public, or super_admin/marketplace_manager with a token | Single product. Same admin branch as the list above — an inactive product `404`s without a valid admin token |
-| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §16.9, new code should use that instead |
+| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §17.9, new code should use that instead |
 | POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold?, weightKg? }` — `weightKg` (kg per single unit) feeds shipping-fee calculation (§9); omitted/absent is treated as 0kg |
 | PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `categoryId`, `name`, `description`, `priceUsd`, `images`, `active`, `weightKg` — `categoryId` lets a product move to a different category, e.g. to empty one out before deleting it |
 | DELETE | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it has any order history (real orders reference it) — deactivate instead (`PATCH { active: false }`), which already hides it from the storefront without touching order records. A never-ordered product deletes cleanly, its stock row goes with it |
@@ -256,10 +296,10 @@ Register both endpoints in each Stripe dashboard, subscribed to at least
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/marketplace/orders` | public | Guest COD checkout. Body: `{ customerName, customerPhone, deliveryAddress, notes?, items: [{ productId, quantity }] }`. `shippingFee` is **computed server-side** from the items' weight and the current `ShippingRate` table (below) — never taken from the request (closes a gap `BACKEND_PLAN.md` §7 left open, where it used to be a flat, client-supplied value; a `shippingFee` in the request body is now silently ignored) |
+| POST | `/api/marketplace/orders` | public | Guest checkout — card-paid up front (`BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md`), see §1.5. Body: `{ customerName, customerPhone, deliveryAddress, notes?, items: [{ productId, quantity }] }`. Creates the `Order` (`pending`) and a Stripe PaymentIntent on the `sri_lanka` account in one request. Returns `{ order, clientSecret }` — mirrors `POST /api/bookings`'s `CreateBookingResponse` exactly. `shippingFee` is **computed server-side** from the items' weight and the current `ShippingRate` table (below) — never taken from the request |
 | GET | `/api/marketplace/orders/:id` | public | Order status lookup |
 | GET | `/api/marketplace/orders?status=` | super_admin, marketplace_manager | List orders, optional status filter |
-| PATCH | `/api/marketplace/orders/:id/status` | super_admin, marketplace_manager | Body: `{ status }`. Valid transitions enforced server-side (see §1.5) |
+| PATCH | `/api/marketplace/orders/:id/status` | super_admin, marketplace_manager | Body: `{ status }`. Valid transitions enforced server-side (see §1.5). A `pending → confirmed` transition is verified against Stripe first (§1.5 point 3) rather than trusted outright. A transition to `cancelled`/`returned` from any paid status triggers a full Stripe refund of `total` (§1.5 point 4) |
 | GET | `/api/marketplace/shipping-rates` | public | List the current price-per-kg bands (`{ fromKg, toKg, pricePerKg }[]`), sorted by `fromKg` — checkout needs to price shipping before the customer has any session |
 | PUT | `/api/marketplace/shipping-rates` | super_admin, marketplace_manager | Body: `{ rates: [{ fromKg, toKg, pricePerKg }, ...] }` — **bulk replace** (delete-all-then-recreate in one transaction, not an upsert — rows have no natural stable identity to upsert against, since an admin reconfiguring the bands can freely change how many exist and where they start/end). Returns the full new list |
 
@@ -336,7 +376,28 @@ Only `super_admin` manages blog content — posts aren't cleanly scoped to one
 property or the marketplace the way `villa_manager`/`marketplace_manager`
 are, so this is deliberately not role-split further for now.
 
-## 13. Admin — `/api/admin`
+## 13. Testimonials — `/api/testimonials`
+
+Admin-manageable reviews for the "Our Client Says!" carousel on both
+marketing sites, replacing what used to be a hardcoded array per site. See
+`BACKEND_CHANGES_TESTIMONIALS.md`. Scoped to a `site` as a whole (`italy` |
+`sri_lanka`), not an individual `Property` — same reasoning as Blog above,
+and matching how the carousel is used today.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/testimonials?site=` | public, or super_admin with a token | **Without** a valid admin token: `site` is required, returns that site's `active`-only testimonials sorted by `sortOrder`. **With** a `super_admin` token: `site` becomes optional (omit to list both sites at once) and inactive rows are included too — same dual-purpose-route pattern as Blog's `GET /posts` above |
+| POST | `/api/testimonials` | super_admin | Body: `{ site, name, role, quote, rating (1–5), sortOrder?, active? }` |
+| PATCH | `/api/testimonials/:id` | super_admin | Partial update of `{ name, role, quote, rating, sortOrder, active }` — `site` is deliberately not editable here; delete and recreate on the other site if a review ever genuinely needs to move |
+| DELETE | `/api/testimonials/:id` | super_admin | Hard delete — no downstream records reference a `Testimonial` the way they do a `Product`/`Room`/`Booking`, so there's no history-guard needed. `active: false` via `PATCH` already covers "hide but keep" |
+
+Only `super_admin` manages testimonials, same tier as Blog and the Guest
+Info Form template — not cleanly scoped to one property or the marketplace.
+Both public carousels fall back to their existing hardcoded reviews if this
+endpoint 404s or returns an empty list, so this shipping is not a breaking
+change for either storefront.
+
+## 14. Admin — `/api/admin`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -348,7 +409,7 @@ are, so this is deliberately not role-split further for now.
 | GET | `/api/admin/users` | super_admin | List all admin accounts (`id, email, role, propertyScopeId, createdAt` — never `passwordHash`) |
 | DELETE | `/api/admin/users/:id` | super_admin | Remove an admin account. `400` if you try to delete the account you're currently authenticated as (avoids stranding your own session with no other super_admin to undo it); `404` if the id doesn't exist. No "last super_admin" guard — it's possible to delete every super_admin account, so be deliberate |
 
-## 14. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
+## 15. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
 
 Lets an admin send a booked guest a link, by email, to a short form
 collecting whatever extra info is needed before their stay (passport number,
@@ -382,11 +443,11 @@ not by a background job, so nothing needs to run for it to be accurate.
 No customer accounts, no sessions — knowing the token *is* the access
 control, same trust model as `Property.icalExportToken` elsewhere in this
 API. Uploaded documents go to the same S3/R2 bucket as `/api/uploads/images`
-(§16.9), under a `guest-documents/` prefix.
+(§17.9), under a `guest-documents/` prefix.
 
 ---
 
-## 15. Analytics / click heatmaps — `/api/analytics`
+## 16. Analytics / click heatmaps — `/api/analytics`
 
 A Plerdy/Hotjar-style click heatmap: a collector on every public page (never
 `/admin/*`) beacons each click's normalized position back here; the admin
@@ -412,11 +473,11 @@ policy pages first.
 
 ---
 
-## 16. Frontend integration checklist
+## 17. Frontend integration checklist
 
 Things a frontend needs to know that aren't obvious from the endpoint list above.
 
-### 16.1 Stripe publishable keys — not provided by this API
+### 17.1 Stripe publishable keys — not provided by this API
 
 This backend only ever holds Stripe **secret** keys, server-side
 (`STRIPE_ITALY_SECRET_KEY` / `STRIPE_SRILANKA_SECRET_KEY`). To initialize
@@ -431,7 +492,7 @@ publishable/secret key pair (frontend using the wrong account's key) fails
 with a "No such payment_intent" error client-side — the two keys must come
 from the *same* Stripe account.
 
-### 16.2 Confirming payment — use the Payment Element, and pass a `return_url`
+### 17.2 Confirming payment — use the Payment Element, and pass a `return_url`
 
 PaymentIntents are created with `automatic_payment_methods: { enabled: true }`
 (default `allow_redirects: "always"`), so each one's `payment_method_types`
@@ -446,7 +507,7 @@ Dashboard (restrict enabled payment methods) or ask for a backend change to
 set `allow_redirects: "never"` in `payments/service.ts` — not something to
 work around purely in the frontend.
 
-### 16.3 Booking confirmation is asynchronous — poll after `confirmPayment`
+### 17.3 Booking confirmation is asynchronous — poll after `confirmPayment`
 
 `stripe.confirmPayment()` resolving successfully in the browser does **not**
 mean `booking.status` is `confirmed` yet — that only happens once Stripe's
@@ -457,7 +518,7 @@ poll `GET /api/bookings/:id` (e.g. every 1–2s, give up after ~15s) until
 timeout there most likely means the webhook is just running slightly behind,
 not that anything failed — word the UI accordingly rather than showing an error.
 
-### 16.4 The hold has a countdown — show it, and handle expiry gracefully
+### 17.4 The hold has a countdown — show it, and handle expiry gracefully
 
 `POST /api/bookings` returns `booking.expiresAt` (15 minutes out by default,
 `BOOKING_HOLD_MINUTES`). If checkout isn't completed by then, a cron job
@@ -467,7 +528,7 @@ the next poll). Show a visible countdown during checkout, and if payment
 fails after the hold appears to have expired, message it as "your hold
 expired, please start again" rather than a generic payment error.
 
-### 16.5 Two different "room" concepts — check `property.rooms` first
+### 17.5 Two different "room" concepts — check `property.rooms` first
 
 Check `GET /api/properties/:slug`'s `rooms` array (§3) before deciding which
 picker to render — it's non-empty only for a property that's been
@@ -500,21 +561,21 @@ Either way: never compute or send a price yourself — the server always
 derives `totalPrice` itself, from whichever of the two mechanisms applies
 to that property.
 
-### 16.6 Currency is per-property
+### 17.6 Currency is per-property
 
 `property.currency` is `"eur"` for The Nest Bologna and `"usd"` for Dona's
 Villa — format guest-facing prices accordingly (`€` vs `$`), don't hardcode
 one currency site-wide. `Booking.currency` in every booking response always
 matches `property.currency`.
 
-### 16.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
+### 17.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
 
 `checkIn`/`checkOut` are stored as dates only, no time component. Sending a
 full ISO datetime risks the calendar date shifting by a day once converted to
 UTC (e.g. a late-evening Sri Lanka timestamp rolling into the next UTC day).
 Always send plain date strings, e.g. `"2026-08-01"`.
 
-### 16.8 CORS
+### 17.8 CORS
 
 `CORS_ORIGIN` in the backend's `.env` must exactly match the frontend's
 origin (`src/app.ts` → `cors({ origin: env.corsOrigin })`, currently only a
@@ -522,7 +583,7 @@ single origin string, no allowlist). Defaults to `http://localhost:3000` for
 local dev — update it before deploying if the production frontend domain
 differs.
 
-### 16.9 Image upload
+### 17.9 Image upload
 
 `POST /api/uploads/images` is the one shared upload endpoint — used by the
 product catalog, offers, and blog alike. It proxies the upload through this
@@ -568,7 +629,7 @@ feature-specific upload routes going forward.
 
 ---
 
-## 17. Error shape
+## 18. Error shape
 
 ```json
 { "error": "date_conflict", "message": "These dates are no longer available for this property." }
@@ -579,7 +640,7 @@ Validation errors (Zod) return `400` with
 — `path` is dot-joined, prefixed with `body`/`query`/`params` per where the
 field lives in the request.
 
-## 18. Not yet wired (see BACKEND_PLAN.md for context)
+## 19. Not yet wired (see BACKEND_PLAN.md for context)
 
 - WhatsApp transfer confirmations (currently a manual admin action, per plan §11)
 - Government ID-export endpoint for Italy/Sri Lanka compliance filing (data is captured on `Booking`, export route not yet built)

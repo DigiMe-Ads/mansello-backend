@@ -26,6 +26,7 @@ import {
 import { propertyRoomsRoutes, roomRoutes } from "@/modules/rooms/routes";
 import { propertyRateOverrideRoutes, rateOverrideRoutes } from "@/modules/rateOverrides/routes";
 import analyticsRoutes from "@/modules/analytics/routes";
+import testimonialsRoutes from "@/modules/testimonials/routes";
 
 export function createApp() {
   const app = express();
@@ -78,6 +79,7 @@ export function createApp() {
   app.use("/api/uploads", uploadsRoutes);
   app.use("/api/booking-info-requests", bookingInfoPublicRoutes);
   app.use("/api/analytics", analyticsRoutes);
+  app.use("/api/testimonials", testimonialsRoutes);
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);

@@ -368,19 +368,24 @@ model StockLevel {
 }
 
 model Order {
-  id               String      @id @default(uuid())
-  customerName     String
-  customerPhone    String
-  deliveryAddress  String
-  notes            String?
-  status           OrderStatus @default(pending)
-  paymentMethod    String      @default("cod")
-  shippingFee      Decimal     @db.Decimal(10, 2)
-  subtotal         Decimal     @db.Decimal(10, 2)
-  total            Decimal     @db.Decimal(10, 2)
-  flaggedForReview Boolean     @default(false)
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
+  id                    String      @id @default(uuid())
+  customerName          String
+  customerPhone         String
+  deliveryAddress       String
+  notes                 String?
+  status                OrderStatus @default(pending)
+  // "cod" survives as a historical value on pre-BACKEND_CHANGES_MARKETPLACE_PAYMENTS
+  // rows only — every order created after that change is "card": checkout now
+  // requires a successful Stripe PaymentIntent the same way a villa booking
+  // does, see stripePaymentIntentId below.
+  paymentMethod         String      @default("card")
+  stripePaymentIntentId String? // set once the order's PaymentIntent is created (before payment succeeds — mirrors Booking.stripePaymentIntentId, attached pre-payment so the webhook has something to match against)
+  shippingFee           Decimal     @db.Decimal(10, 2)
+  subtotal              Decimal     @db.Decimal(10, 2)
+  total                 Decimal     @db.Decimal(10, 2)
+  flaggedForReview      Boolean     @default(false)
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
 
   items OrderItem[]
 
@@ -498,4 +503,23 @@ model ClickEvent {
   createdAt      DateTime    @default(now()) // server receive time
 
   @@index([path, device, occurredAt])
+}
+
+// Admin-manageable reviews for the "Our Client Says!" carousels — scoped to
+// a Site as a whole (Italy vs Sri Lanka), not an individual Property, since
+// that's how the carousel is used today. See
+// BACKEND_CHANGES_TESTIMONIALS.md.
+model Testimonial {
+  id        String   @id @default(uuid())
+  site      Site
+  name      String
+  role      String // freeform, e.g. "Airbnb Guest · 1 night" — matches today's hardcoded copy
+  quote     String
+  rating    Int // 1–5
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true) // false = unpublished (e.g. a guest asks for it to come down) without losing the record
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([site, active, sortOrder])
 }
