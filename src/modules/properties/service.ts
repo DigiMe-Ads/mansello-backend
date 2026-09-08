@@ -64,6 +64,11 @@ export function updateProperty(
     checkOutTime: string;
     airbnbIcalImportUrls: string[];
     transportEnabled: boolean;
+    // See BACKEND_CHANGES_ICAL_MINUS_ONE_DAY.md — deliberately toggleable
+    // with no deploy, since two properties can reasonably want different
+    // answers, and it should only ever be flipped after confirming a
+    // specific listing's own feed actually pads its checkout day.
+    icalCheckoutDayBuffer: boolean;
   }>
 ) {
   return prisma.property.update({ where: { id }, data });

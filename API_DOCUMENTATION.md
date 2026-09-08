@@ -71,9 +71,46 @@ property's `airbnb_ical_import_url`, and upserts `source = 'airbnb'` blocks
 back to Airbnb via `GET /ical/:icalExportToken.ics` — paste that URL into
 Airbnb's "Import Calendar" field. A same-day double-booking during Airbnb's
 own refresh window is a known, accepted residual risk (see
-`BACKEND_PLAN.md` §4); if the exclusion constraint ever rejects an Airbnb
-event because a direct booking already holds that range, it's logged for
-manual admin reconciliation rather than crashing the sync.
+`BACKEND_PLAN.md` §4); if the exclusion constraint ever rejects a **new**
+Airbnb event because a direct booking already holds that range, it's logged
+for manual admin reconciliation rather than crashing the sync.
+
+**`property.icalCheckoutDayBuffer`** (`BACKEND_CHANGES_ICAL_MINUS_ONE_DAY.md`)
+— `true` by default on every property (today's unchanged behavior: an
+imported block's `endDate` is stored exactly as the feed's `DTEND`, with no
+adjustment). Set to `false` for one property to trim that block's `endDate`
+back by one day, for whole-day (`VALUE=DATE`) events only, with a one-night
+minimum floor (a genuine 1-night stay never collapses to zero nights
+blocked) — this is meant to correct an OTA feed that pads the checkout day
+as a conservative safety margin for third-party calendar consumers.
+**Investigated and found not to apply to either real property as currently
+deployed** — this codebase's own iCal parsing does not itself pad anything
+(confirmed by reading `node-ical`'s DTEND handling), and neither property's
+live data showed evidence of feed-side padding (`turnoverBufferDays` is `0`
+on both, and The Nest Bologna has several genuinely back-to-back Airbnb
+reservations that could only exist if its feed's checkout days are already
+correct). **Do not flip this for a property without first confirming, from
+that specific listing's own Airbnb dashboard, that its feed's `DTEND`
+really does include the turnover day** — applying it to a feed that's
+already correct frees a genuinely occupied night. Toggle via
+`PATCH /api/properties/:propertyId` (§2), same as `transportEnabled`.
+
+**Fixed alongside the above, found while investigating it:** the
+`try/catch` around a conflict used to only wrap the *create* path for a
+never-before-seen event UID. An *update* to an already-imported block (the
+feed's dates for a known reservation changed) had no equivalent guard — if
+it collided with the exclusion constraint, the exception propagated up to
+the per-feed `try/catch` that also wraps the initial fetch, aborting the
+rest of that feed's events *and* skipping the "release stale blocks" step
+for that property on that sync run, rather than logging just that one
+event and continuing. Reproduced live against The Nest Bologna's real feed
+(a `23P01` exclusion violation on an `availabilityBlock.update()`,
+unrelated to `icalCheckoutDayBuffer` — it fired identically with the flag
+at its default `true`) — see `BACKEND_CHANGES_AIRBNB_SYNC_UPDATE_CONFLICT_FIX.md`
+for the incident and the fix, which now wraps both paths identically. This
+had been silently skipping stale-block release on every affected sync run;
+re-running against the real feed after the fix immediately released 10
+genuinely-past blocks that had been stuck `active` for weeks.
 
 ### 1.4 Two Stripe accounts
 
@@ -137,7 +174,7 @@ blocked.
 |---|---|---|---|
 | GET | `/api/properties` | public | List both properties with pricing tiers |
 | GET | `/api/properties/:slug` | public | Get one property by slug (`the-nest-bologna`, `donas-villa`). Includes a `rooms` array (active rooms, sorted by `sortOrder`) for a property that has any configured — see §3. Empty array for one that doesn't (The Nest Bologna). Also includes `transportEnabled` and a `transportRates` array (see below and §6) — the same embed-it-on-the-property pattern as `rooms`/`rateOverrides`, so the booking page can show a transfer price with no second round trip |
-| PATCH | `/api/properties/:propertyId` | super_admin, villa_manager (own property) | Update config: `minNights`, `turnoverBufferDays`, `checkInTime`, `checkOutTime`, `airbnbIcalImportUrls` (array — a property can be listed multiple times on Airbnb), `transportEnabled` (bool — property-wide kill switch for the airport-transfer add-on, see §6) |
+| PATCH | `/api/properties/:propertyId` | super_admin, villa_manager (own property) | Update config: `minNights`, `turnoverBufferDays`, `checkInTime`, `checkOutTime`, `airbnbIcalImportUrls` (array — a property can be listed multiple times on Airbnb), `transportEnabled` (bool — property-wide kill switch for the airport-transfer add-on, see §6), `icalCheckoutDayBuffer` (bool, default `true` — see §1.3; flip to `false` only after confirming that specific listing's Airbnb feed actually pads its checkout day) |
 | PUT | `/api/properties/:propertyId/pricing-tiers` | super_admin, villa_manager (own property) | Body: `{ "tiers": [{ "guestCount": 2, "rooms": 1, "pricePerNight": 120 }, ...] }`. `rooms` defaults to 1 if omitted — only Dona's Villa needs more than one tier per `guestCount`. Upserts only — doesn't remove tiers missing from the array |
 | DELETE | `/api/properties/:propertyId/pricing-tiers/:tierId` | super_admin, villa_manager (own property) | Remove a single pricing tier. `404` if it doesn't exist or belongs to a different property |
 | GET | `/api/properties/:propertyId/transport-rates` | public | List this property's `TransportRate` rows (`{ id, propertyId, guestCount, price, active }[]`), sorted by `guestCount`. Only rows that exist — a missing `guestCount` means "not offered for that party size", not `0`. See §6 |

@@ -127,6 +127,16 @@ model Property {
   // default so an unmigrated property behaves exactly as before this
   // feature existed. See BACKEND_CHANGES_VILLA_TRANSPORT.md.
   transportEnabled      Boolean          @default(false)
+  // Whether the Airbnb import keeps today's padded checkout-day behavior
+  // (true, the default) or trims the imported block's end date back by one
+  // day (false) — see BACKEND_CHANGES_ICAL_MINUS_ONE_DAY.md. Named for what
+  // `true` means so an unmigrated/unconfigured property is unchanged: this
+  // was investigated and found NOT to apply to either real property as
+  // deployed (no evidence of feed padding, turnoverBufferDays already 0) —
+  // this column exists so a specific listing can be opted in later, only
+  // after confirming its own feed actually pads, never flip this without
+  // that confirmation first.
+  icalCheckoutDayBuffer Boolean          @default(true)
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt
 
