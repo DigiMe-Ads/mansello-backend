@@ -1,5 +1,11 @@
 import { prisma } from "@/db/prisma";
 
+// Matches the frontend's FLAT_SHIPPING_FEE fallback (src/lib/shipping.ts) —
+// used only when every configured band is priced at 0, which the admin grid
+// ships with by default and treats as "not configured yet" rather than
+// "shipping is free". See BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md.
+const FALLBACK_FLAT_FEE = 5;
+
 export function listShippingRates() {
   return prisma.shippingRate.findMany({ orderBy: { fromKg: "asc" } });
 }
@@ -10,10 +16,23 @@ export function listShippingRates() {
 // how many rows exist and where they start/end. Delete-all-then-recreate
 // in one transaction, same as any other "the whole set is the new set"
 // admin save.
-export async function replaceShippingRates(rates: { fromKg: number; toKg: number; pricePerKg: number }[]) {
+//
+// Accepts either `price` (current) or the old `pricePerKg` name for one
+// release, so this backend and a not-yet-redeployed frontend (or vice
+// versa) both keep working during rollout — see
+// BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md §2. Drop the `pricePerKg`
+// fallback once both sides are confirmed on the new name.
+export async function replaceShippingRates(
+  rates: { fromKg: number; toKg: number; price?: number; pricePerKg?: number }[]
+) {
+  const normalized = rates.map((r) => ({
+    fromKg: r.fromKg,
+    toKg: r.toKg,
+    price: r.price ?? r.pricePerKg ?? 0,
+  }));
   await prisma.$transaction([
     prisma.shippingRate.deleteMany({}),
-    prisma.shippingRate.createMany({ data: rates }),
+    prisma.shippingRate.createMany({ data: normalized }),
   ]);
   return listShippingRates();
 }
@@ -22,7 +41,8 @@ export async function replaceShippingRates(rates: { fromKg: number; toKg: number
 // the submitted items' weight and the current ShippingRate table, never
 // trusted from the client (closes the gap BACKEND_PLAN.md §7 left open,
 // where CreateOrderInput.shippingFee was a flat, client-supplied constant).
-// See BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4.
+// See BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4 and
+// BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md for the current algorithm.
 export async function computeShippingFee(
   items: { productId: string; quantity: number }[],
   products: { id: string; weightKg: unknown }[]
@@ -44,25 +64,31 @@ export async function computeShippingFee(
   const roundedWeightKg = Math.max(1, Math.ceil(totalWeightKgRaw));
 
   const rates = await prisma.shippingRate.findMany({ orderBy: { fromKg: "asc" } });
-  // No bands configured at all — nothing to price against. $0 rather than
-  // silently trusting a client-sent value (that's exactly the gap this is
-  // closing) or guessing at a fallback constant this module doesn't own.
-  if (rates.length === 0) return 0;
+  // A $0 row means "not filled in yet", not "this weight ships free" — the
+  // admin grid ships with every band at 0, and a still-zero row is
+  // excluded from band selection entirely rather than being a real
+  // candidate (confirmed against the doc's own test vectors: with bands
+  // 1–3kg priced and 4–15kg left at 0, a 5kg order must resolve to the
+  // 3kg band's price via the "above every [configured] band" rule, not to
+  // the literal 5kg row's $0). If nothing is priced at all, fall back to
+  // the same flat fee the frontend's checkout preview uses instead of
+  // disagreeing with it.
+  const configuredRates = rates.filter((r) => Number(r.price) !== 0);
+  if (configuredRates.length === 0) return FALLBACK_FLAT_FEE;
 
-  const rate = pickShippingRate(roundedWeightKg, rates);
-  return roundedWeightKg * Number(rate.pricePerKg);
+  return Number(pickShippingRate(roundedWeightKg, configuredRates).price);
 }
 
 interface ShippingRateRow {
   fromKg: number;
   toKg: number;
-  pricePerKg: unknown;
+  price: unknown;
 }
 
-// BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §2.2 — two bugs fixed here,
-// both only reachable with admin-configured bands that aren't a single
-// contiguous, non-overlapping run (freely possible via replaceShippingRates,
-// so a realistic data-entry outcome, not a hypothetical):
+// BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md §3 — the band's `price` IS
+// the fee (no multiplication by weight; see the ShippingRate model comment
+// for why that used to be wrong). Band selection itself is unchanged from
+// the BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §2.2 fix:
 //
 // (a) A weight in a *gap* between bands (e.g. bands 1–3kg and 6–10kg, a 4kg
 //     order) used to fall through to `rates[0]` — whichever band happens to

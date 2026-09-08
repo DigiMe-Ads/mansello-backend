@@ -18,6 +18,8 @@ const bookingBody = z
     // (must be empty/omitted) for one that doesn't. `rooms` above is derived
     // from this server-side when present, not trusted from the client.
     roomIds: z.array(z.string().uuid()).optional(),
+    // A flag only, never a price — see BACKEND_CHANGES_VILLA_TRANSPORT.md §4.
+    transportRequested: z.boolean().optional(),
   })
   // Cheap insurance, not a substitute for server-side trust — this is public,
   // unauthenticated input, and the frontend already clamps this client-side.

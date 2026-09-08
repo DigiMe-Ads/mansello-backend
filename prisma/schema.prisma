@@ -121,6 +121,12 @@ model Property {
   cityTaxMaxNights      Int              @default(5) // nights beyond this aren't taxed — the room price still is
   cityTaxExemptAgeUnder Int              @default(14) // guests younger than this pay no tax
   cityTaxBands          Json             @default("[]") // CityTaxBand[] — { minPricePerPersonPerNight, maxPricePerPersonPerNight: number | null, ratePerPersonPerNight }[], sorted ascending
+  // Priced airport-transfer add-on — a property-wide kill switch, separate
+  // from each TransportRate row's own `active` flag (that's "no vehicle for
+  // this party size"; this is "we don't offer this at all"). false is the
+  // default so an unmigrated property behaves exactly as before this
+  // feature existed. See BACKEND_CHANGES_VILLA_TRANSPORT.md.
+  transportEnabled      Boolean          @default(false)
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt
 
@@ -128,10 +134,29 @@ model Property {
   availabilityBlocks AvailabilityBlock[]
   bookings           Booking[]
   transportRequests  TransportRequest[]
+  transportRates     TransportRate[]
   adminUsers         AdminUser[]
   offers             Offer[]
   rooms              Room[]
   rateOverrides      RateOverride[]
+}
+
+// Priced-per-party airport transfer, one row per guest count 1–8 — a
+// separate concept from TransportRequest above (that's the unpriced
+// enquiry/quote lead that still fires alongside this; this is what makes
+// the transfer an add-on the guest pays for at checkout). See
+// BACKEND_CHANGES_VILLA_TRANSPORT.md.
+model TransportRate {
+  id         String   @id @default(uuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  guestCount Int // 1–8, exact match only — no banding (see modules/bookings/service.ts)
+  price      Decimal  @default(0) @db.Decimal(10, 2) // flat price for the whole party, not per person
+  active     Boolean  @default(false) // lets a property stop offering a given party size without losing the configured price
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([propertyId, guestCount])
 }
 
 // Individually-bookable rooms (Dona's Villa) — a property with zero Room
@@ -253,8 +278,9 @@ model Booking {
   roomIds               String[]      @default([]) // specific Room ids reserved — non-empty iff the property has rooms configured, empty for single-unit properties (The Nest Bologna)
   accommodationPrice    Decimal       @db.Decimal(10, 2) // pure room cost: pricePerNight × nights — what totalPrice meant before city tax existed
   cityTax               Decimal       @default(0) @db.Decimal(10, 2) // computed from Property.cityTaxBands; 0 when the property doesn't have cityTaxEnabled
+  transportPrice        Decimal       @default(0) @db.Decimal(10, 2) // flat, charged once regardless of nights — 0 unless transportRequested was true AND a matching active TransportRate existed at booking time. See BACKEND_CHANGES_VILLA_TRANSPORT.md
   childrenUnder14       Int           @default(0) // recorded for audit — the exemption math is already baked into cityTax by the time this is stored
-  totalPrice            Decimal       @db.Decimal(10, 2) // = accommodationPrice + cityTax — the amount actually charged via Stripe
+  totalPrice            Decimal       @db.Decimal(10, 2) // = accommodationPrice + cityTax + transportPrice — the amount actually charged via Stripe
   currency              String        @default("usd")
   stripePaymentIntentId String?
   status                BookingStatus @default(pending_payment)
@@ -349,13 +375,21 @@ model Product {
 // Small, admin-managed global table (not per-product) — a price-per-kg band
 // table used to compute an order's shippingFee from its total weight. See
 // BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4.
+// Bands are exactly 1kg wide in practice (fromKg == toKg on every row the
+// admin UI creates) and `price` is the FLAT delivery charge for an order in
+// that band — NOT a per-kg rate multiplied by weight. Renamed from
+// `pricePerKg` (BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md) after that
+// name caused a real production bug: the client filled in "$9.99 for a 3kg
+// order" and it got charged as 3 × $9.99 = $29.97. Existing values were NOT
+// transformed by that migration — they were always flat prices, just
+// multiplied incorrectly by application code.
 model ShippingRate {
-  id         String   @id @default(uuid())
-  fromKg     Int
-  toKg       Int
-  pricePerKg Decimal  @db.Decimal(10, 2)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id        String   @id @default(uuid())
+  fromKg    Int
+  toKg      Int
+  price     Decimal  @default(0) @db.Decimal(10, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model StockLevel {
@@ -487,6 +521,8 @@ model AdminUser {
   tokenVersion    Int       @default(0)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+
+  siteContentEdits SiteContent[]
 }
 
 // Raw, high-volume click-heatmap data — not tied to Property/Booking/etc.,
@@ -533,4 +569,22 @@ model Testimonial {
   updatedAt DateTime @updatedAt
 
   @@index([site, active, sortOrder])
+}
+
+// Flat key/value store for admin-editable marketing copy — deliberately not
+// a schema-per-section design. The frontend owns the schema (which keys
+// exist, their type, default, and which component renders them —
+// src/lib/content/schema.ts); this table only stores strings against
+// opaque keys like "italy.hero.title" or "global.contact.email". Adding a
+// new editable field on the frontend never requires a backend change: an
+// absent key just means "use the built-in default" — see
+// BACKEND_CHANGES_SITE_CONTENT.md. `key` is never parsed or validated
+// against a known list; only its `value` gets format-checked (size cap,
+// URL-shape check for image/social keys — modules/content/validation.ts).
+model SiteContent {
+  key         String     @id
+  value       String
+  updatedAt   DateTime   @updatedAt
+  updatedById String?
+  updatedBy   AdminUser? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
 }

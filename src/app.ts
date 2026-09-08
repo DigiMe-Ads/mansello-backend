@@ -27,6 +27,8 @@ import { propertyRoomsRoutes, roomRoutes } from "@/modules/rooms/routes";
 import { propertyRateOverrideRoutes, rateOverrideRoutes } from "@/modules/rateOverrides/routes";
 import analyticsRoutes from "@/modules/analytics/routes";
 import testimonialsRoutes from "@/modules/testimonials/routes";
+import { propertyTransportRatesRoutes, adminTransportRatesRoutes } from "@/modules/transportRates/routes";
+import { publicRoutes as contentPublicRoutes, adminRoutes as contentAdminRoutes } from "@/modules/content/routes";
 
 export function createApp() {
   const app = express();
@@ -80,6 +82,12 @@ export function createApp() {
   app.use("/api/booking-info-requests", bookingInfoPublicRoutes);
   app.use("/api/analytics", analyticsRoutes);
   app.use("/api/testimonials", testimonialsRoutes);
+  // Adds /:propertyId/transport-rates on top of the routes above — a
+  // separate router (see modules/transportRates/routes.ts).
+  app.use("/api/properties", propertyTransportRatesRoutes);
+  app.use("/api/admin/properties", adminTransportRatesRoutes);
+  app.use("/api/content", contentPublicRoutes);
+  app.use("/api/admin/content", contentAdminRoutes);
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);

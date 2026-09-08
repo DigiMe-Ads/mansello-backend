@@ -22,6 +22,7 @@ export async function startBooking(req: Request, res: Response) {
     rooms: req.body.rooms ?? 1,
     childrenUnder14: req.body.childrenUnder14,
     roomIds: req.body.roomIds,
+    transportRequested: req.body.transportRequested,
   });
 
   let intent;
@@ -58,6 +59,7 @@ export async function createOfflineBooking(req: Request, res: Response) {
     rooms: req.body.rooms ?? 1,
     childrenUnder14: req.body.childrenUnder14,
     roomIds: req.body.roomIds,
+    transportRequested: req.body.transportRequested,
     totalPriceOverride: req.body.totalPriceOverride,
   });
   res.status(201).json(booking);

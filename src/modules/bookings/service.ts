@@ -124,7 +124,8 @@ export async function computeBookingPrice(
   guests: number,
   rooms: number,
   childrenUnder14 = 0,
-  roomIds?: string[]
+  roomIds?: string[],
+  transportRequested = false
 ) {
   const property = await prisma.property.findUnique({ where: { id: propertyId } });
   if (!property) throw ApiError.notFound("Property not found");
@@ -253,13 +254,31 @@ export async function computeBookingPrice(
   }
   const pricePerNight = nights > 0 ? accommodationPrice / nights : 0; // average actually-charged nightly rate, informational
 
+  // Priced airport transfer — flat, charged once per booking regardless of
+  // nights (unlike accommodationPrice/cityTax, which are summed per night
+  // above). See BACKEND_CHANGES_VILLA_TRANSPORT.md §4. Silently prices to 0
+  // rather than erroring when transportRequested is true but nothing
+  // matches (property doesn't offer it, or no active rate for this exact
+  // guest count) — an optional extra should never fail a booking; the
+  // frontend already hides the checkbox/price when there's no rate, so
+  // reaching this state means stale data or a crafted request, not a
+  // legitimate guest flow.
+  let transportPrice = 0;
+  if (transportRequested && property.transportEnabled) {
+    const rate = await prisma.transportRate.findUnique({
+      where: { propertyId_guestCount: { propertyId, guestCount: guests } },
+    });
+    if (rate?.active) transportPrice = Number(rate.price);
+  }
+
   return {
     property,
     nights,
     pricePerNight,
     accommodationPrice,
     cityTax,
-    totalPrice: accommodationPrice + cityTax, // <- what actually gets charged
+    transportPrice,
+    totalPrice: accommodationPrice + cityTax + transportPrice, // <- what actually gets charged
     currency: property.currency,
     rooms: selectedRooms, // empty for a non-room booking
   };
@@ -278,6 +297,7 @@ export interface CreatePendingBookingInput {
   rooms: number;
   childrenUnder14?: number;
   roomIds?: string[];
+  transportRequested?: boolean;
 }
 
 // Creates the AvailabilityBlock row(s) for a booking inside its transaction
@@ -360,7 +380,8 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
     input.guests,
     input.rooms,
     input.childrenUnder14,
-    input.roomIds
+    input.roomIds,
+    input.transportRequested
   );
   const expiresAt = new Date(Date.now() + env.bookingHoldMinutes * 60_000);
   const roomIds = priced.rooms.map((r) => r.id);
@@ -382,6 +403,7 @@ export async function createPendingBooking(input: CreatePendingBookingInput) {
           roomIds,
           accommodationPrice: priced.accommodationPrice,
           cityTax: priced.cityTax,
+          transportPrice: priced.transportPrice,
           childrenUnder14: input.childrenUnder14 ?? 0,
           totalPrice: priced.totalPrice,
           currency: priced.currency,
@@ -425,7 +447,8 @@ export async function createOfflineBooking(
     input.guests,
     input.rooms,
     input.childrenUnder14,
-    input.roomIds
+    input.roomIds,
+    input.transportRequested
   );
   const roomIds = priced.rooms.map((r) => r.id);
 
@@ -435,13 +458,21 @@ export async function createOfflineBooking(
   // is still computed from the standard tier rate per the comune's rule
   // (banded on the underlying price, not the actual charge — see
   // BACKEND_CHANGES_CITY_TAX.md), and backed out of the override so
-  // accommodationPrice + cityTax still equals totalPrice; clamped at 0 for
-  // the pathological case of an override smaller than the tax alone.
+  // accommodationPrice + cityTax + transportPrice still equals totalPrice;
+  // clamped at 0 for the pathological case of an override smaller than tax
+  // + transport alone. transportPrice gets the same treatment as cityTax
+  // here (not cityTax's own reasoning specifically — see
+  // BACKEND_CHANGES_VILLA_TRANSPORT.md, which doesn't address offline
+  // bookings directly): totalPriceOverride is the admin's final negotiated
+  // number, so every pass-through/add-on component is backed out of it the
+  // same way, keeping one consistent invariant instead of two different
+  // ones for cityTax vs. transportPrice.
   const totalPrice = input.totalPriceOverride ?? priced.totalPrice;
   const cityTax = priced.cityTax;
+  const transportPrice = priced.transportPrice;
   const accommodationPrice = input.totalPriceOverride === undefined
     ? priced.accommodationPrice
-    : Math.max(0, totalPrice - cityTax);
+    : Math.max(0, totalPrice - cityTax - transportPrice);
 
   try {
     return await prisma.$transaction(async (tx) => {
@@ -460,6 +491,7 @@ export async function createOfflineBooking(
           roomIds,
           accommodationPrice,
           cityTax,
+          transportPrice,
           childrenUnder14: input.childrenUnder14 ?? 0,
           totalPrice,
           currency: priced.currency,

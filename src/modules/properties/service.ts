@@ -5,10 +5,11 @@ export function listProperties() {
   return prisma.property.findMany({ include: { pricingTiers: true } });
 }
 
-// Includes active rooms and all rateOverrides alongside pricingTiers, so the
-// public site gets them for free with no extra request — empty arrays for a
-// property with none, same no-op-by-default shape as every other
-// room/pricing addition.
+// Includes active rooms, all rateOverrides, and transportRates alongside
+// pricingTiers, so the public site gets them for free with no extra
+// request — empty arrays for a property with none, same no-op-by-default
+// shape as every other room/pricing addition. transportEnabled is a plain
+// scalar column, always present with no `include` needed.
 export function getPropertyBySlug(slug: string) {
   return prisma.property.findUnique({
     where: { slug },
@@ -16,12 +17,16 @@ export function getPropertyBySlug(slug: string) {
       pricingTiers: true,
       rooms: { where: { active: true }, orderBy: { sortOrder: "asc" } },
       rateOverrides: true,
+      transportRates: { orderBy: { guestCount: "asc" } },
     },
   });
 }
 
 export function getPropertyById(id: string) {
-  return prisma.property.findUnique({ where: { id }, include: { pricingTiers: true } });
+  return prisma.property.findUnique({
+    where: { id },
+    include: { pricingTiers: true, transportRates: { orderBy: { guestCount: "asc" } } },
+  });
 }
 
 export function updatePricingTiers(
@@ -58,6 +63,7 @@ export function updateProperty(
     checkInTime: string;
     checkOutTime: string;
     airbnbIcalImportUrls: string[];
+    transportEnabled: boolean;
   }>
 ) {
   return prisma.property.update({ where: { id }, data });

@@ -136,10 +136,12 @@ blocked.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/properties` | public | List both properties with pricing tiers |
-| GET | `/api/properties/:slug` | public | Get one property by slug (`the-nest-bologna`, `donas-villa`). Includes a `rooms` array (active rooms, sorted by `sortOrder`) for a property that has any configured — see §3. Empty array for one that doesn't (The Nest Bologna) |
-| PATCH | `/api/properties/:propertyId` | super_admin, villa_manager (own property) | Update config: `minNights`, `turnoverBufferDays`, `checkInTime`, `checkOutTime`, `airbnbIcalImportUrls` (array — a property can be listed multiple times on Airbnb) |
+| GET | `/api/properties/:slug` | public | Get one property by slug (`the-nest-bologna`, `donas-villa`). Includes a `rooms` array (active rooms, sorted by `sortOrder`) for a property that has any configured — see §3. Empty array for one that doesn't (The Nest Bologna). Also includes `transportEnabled` and a `transportRates` array (see below and §6) — the same embed-it-on-the-property pattern as `rooms`/`rateOverrides`, so the booking page can show a transfer price with no second round trip |
+| PATCH | `/api/properties/:propertyId` | super_admin, villa_manager (own property) | Update config: `minNights`, `turnoverBufferDays`, `checkInTime`, `checkOutTime`, `airbnbIcalImportUrls` (array — a property can be listed multiple times on Airbnb), `transportEnabled` (bool — property-wide kill switch for the airport-transfer add-on, see §6) |
 | PUT | `/api/properties/:propertyId/pricing-tiers` | super_admin, villa_manager (own property) | Body: `{ "tiers": [{ "guestCount": 2, "rooms": 1, "pricePerNight": 120 }, ...] }`. `rooms` defaults to 1 if omitted — only Dona's Villa needs more than one tier per `guestCount`. Upserts only — doesn't remove tiers missing from the array |
 | DELETE | `/api/properties/:propertyId/pricing-tiers/:tierId` | super_admin, villa_manager (own property) | Remove a single pricing tier. `404` if it doesn't exist or belongs to a different property |
+| GET | `/api/properties/:propertyId/transport-rates` | public | List this property's `TransportRate` rows (`{ id, propertyId, guestCount, price, active }[]`), sorted by `guestCount`. Only rows that exist — a missing `guestCount` means "not offered for that party size", not `0`. See §6 |
+| PUT | `/api/admin/properties/:propertyId/transport-rates` | super_admin, villa_manager (own property) | Body: `{ "rates": [{ "guestCount": 1, "price": 25, "active": true }, ...] }` — replaces the whole per-property table in one call (the admin form always saves all eight rows, `guestCount` 1–8, together). Upsert on `(propertyId, guestCount)`. Deliberately mounted under `/api/admin/properties`, not `/api/properties` (unlike every other property-scoped admin write in this section) — matches the exact path the already-shipped frontend module expects |
 
 Every `Property` returned by the endpoints above also carries Bologna's
 municipal tourist tax (*imposta di soggiorno*) config: `cityTaxEnabled`
@@ -210,10 +212,10 @@ range like a normal date field.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms?, childrenUnder14?, roomIds? }`. Price is always computed server-side, never taken from the request, **per night** (see below), and branches on whether the property has any `Room` rows configured (§3): **with** rooms (Dona's Villa) — `roomIds` is required (non-empty), every id must belong to this property and be active, their combined `capacity` must cover `guests`; `rooms` is derived from `roomIds.length` server-side, not trusted from the client. **Without** rooms (The Nest Bologna) — unchanged: `rooms` defaults to 1, `400` if no `PricingTier` is configured for that guest/room combo, and `roomIds` must be omitted (`400` if sent). `childrenUnder14` defaults to 0 and `400`s if it exceeds `guests`, same either way. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates (or, for a room-booking, the whole property — see §1.1) just got taken |
+| POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms?, childrenUnder14?, roomIds?, transportRequested? }`. Price is always computed server-side, never taken from the request, **per night** (see below), and branches on whether the property has any `Room` rows configured (§3): **with** rooms (Dona's Villa) — `roomIds` is required (non-empty), every id must belong to this property and be active, their combined `capacity` must cover `guests`; `rooms` is derived from `roomIds.length` server-side, not trusted from the client. **Without** rooms (The Nest Bologna) — unchanged: `rooms` defaults to 1, `400` if no `PricingTier` is configured for that guest/room combo, and `roomIds` must be omitted (`400` if sent). `childrenUnder14` defaults to 0 and `400`s if it exceeds `guests`, same either way. `transportRequested` is a flag only, never a price — see the airport-transfer pricing note below. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates (or, for a room-booking, the whole property — see §1.1) just got taken |
 | GET | `/api/bookings/:id` | public | Booking status (poll after Stripe confirmation, or for a "my booking" page). The response strips `guestIdDocumentType`/`guestIdDocumentNumber` (a passport/ID number is more sensitive than the id's UUIDv4 secrecy bar was ever meant to protect) and, on the embedded `property`, `icalExportToken`/`airbnbIcalImportUrls` (property-internal secrets with no reason to reach a guest-facing page) — `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §6.2 and the controller comment. Admin-authed reads of the same booking (cancel, guest-info-request scoping) are unaffected — this stripping happens only in this route's response shaping, not in the underlying service call |
 | GET | `/api/bookings/property/:propertyId?status=` | super_admin, villa_manager (own property) | List bookings, optional status filter |
-| POST | `/api/bookings/offline` | super_admin, villa_manager (own property) | Manual/phone/walk-in booking — same body as above (including the room-booking branch), no Stripe. Created as `paid_offline`. Optional `totalPriceOverride` for a negotiated rate (this overrides `accommodationPrice` only — city tax, when the property has it, is still computed from the standard rate and added on top, since it's a pass-through municipal fee, not part of the negotiated room price); otherwise priced the same way as a direct booking |
+| POST | `/api/bookings/offline` | super_admin, villa_manager (own property) | Manual/phone/walk-in booking — same body as above (including the room-booking and `transportRequested` branches), no Stripe. Created as `paid_offline`. Optional `totalPriceOverride` for a negotiated rate — this overrides `accommodationPrice` only; `cityTax` and `transportPrice`, when either applies, are still computed the normal way and backed out of the override so `accommodationPrice + cityTax + transportPrice` still equals it (the override is the admin's final negotiated total, both pass-through components come out of that same number, not added on top of it) — otherwise priced the same way as a direct booking |
 | POST | `/api/bookings/:id/cancel` | super_admin, villa_manager | Body: `{ refundOverride?, reason? }`. Refund defaults to the standard policy (100% ≥7 days out, 50% 3–7 days, 0% <72h) computed off `totalPrice` — which includes city tax, so a full/partial refund refunds the tax portion too (the guest never stayed, so it was never owed to the comune either); triggers a real Stripe refund on the correct account unless `refundOverride` is given |
 
 `booking.status`: `pending_payment` → `confirmed` (via webhook) or `cancelled`
@@ -237,10 +239,10 @@ night of the stay independently resolves to a price, and those are summed:
    reasoning already applied to `totalPriceOverride` below.
 
 `accommodationPrice` is the sum of every night's step-3 result;
-`totalPrice = accommodationPrice + cityTax`, same as always. A property
-with no `RateOverride`/`Offer` rows configured resolves to exactly the old
-flat-rate behavior for every night — this is additive, not a rewrite of
-what an unconfigured property already does.
+`totalPrice = accommodationPrice + cityTax + transportPrice` (see below),
+same as always. A property with no `RateOverride`/`Offer` rows configured
+resolves to exactly the old flat-rate behavior for every night — this is
+additive, not a rewrite of what an unconfigured property already does.
 
 **Price breakdown, for properties with `cityTaxEnabled`** (currently just
 The Nest Bologna): every `Booking` carries `accommodationPrice` (pure room
@@ -248,14 +250,41 @@ cost — `pricePerNight × nights`), `cityTax` (computed from the property's
 `cityTaxBands`, `0` when the property doesn't have city tax), and
 `childrenUnder14` (as submitted, recorded for audit — the exemption math is
 already baked into `cityTax` by the time it's stored). `totalPrice =
-accommodationPrice + cityTax` is the amount actually charged via Stripe (or
-recorded for an offline booking) — for a `cityTaxEnabled: false` property,
+accommodationPrice + cityTax + transportPrice` is the amount actually
+charged via Stripe (or recorded for an offline booking) — for a
+`cityTaxEnabled: false` property with no transfer requested,
 `accommodationPrice` and `totalPrice` are simply equal. Tax is per guest per
 night, banded by the room's price *per person per night* (the underlying
 rate, not whatever any one guest ends up charged), guests under
 `cityTaxExemptAgeUnder` are exempt entirely, and nights beyond
 `cityTaxMaxNights` stop accruing tax (the room price for those nights is
 still charged in full).
+
+**Priced airport transfer** (`transportPrice`, `BACKEND_CHANGES_VILLA_TRANSPORT.md`)
+— an optional add-on, separate from the unpriced transport *enquiry*
+(`POST /api/leads/transport-requests`, §10, which still fires alongside and
+is unchanged; this is what makes the transfer something the guest actually
+pays for at checkout). Priced **per party, not per person** (a transfer for
+4 guests is one vehicle, one price — the admin configures the total for the
+party, not a per-guest rate) and charged **once per booking, never per
+night** (a 7-night stay with a transfer is charged the transfer price
+once, same as a 1-night stay). Resolution, in order:
+
+1. If `transportRequested` was not `true` in the request, or the property's
+   `transportEnabled` is `false` → `transportPrice = 0`.
+2. Otherwise, look up the `TransportRate` row for this exact `guestCount`
+   (§2) — **exact match only, no banding**: a property offering transfers
+   for 1, 2, and 4 guests but not 3 simply doesn't price one for a 3-guest
+   party, it doesn't fall back to the 2- or 4-guest row.
+3. If no row exists for that `guestCount`, or it exists but `active` is
+   `false` → `transportPrice = 0`.
+4. Otherwise → `transportPrice = ` that row's `price`.
+
+Silently prices to `0` rather than erroring when `transportRequested: true`
+doesn't resolve to an active rate — the frontend already hides the
+checkbox/price when there's no rate for the current party size, so reaching
+this state means stale data or a crafted request, and an optional extra
+should never fail a booking outright.
 
 ## 7. Payments (webhooks only — no public endpoints)
 
@@ -285,7 +314,7 @@ missing, matching every PaymentIntent created before
 | DELETE | `/api/marketplace/catalog/categories/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it still has any products — delete or move them first, no cascade |
 | GET | `/api/marketplace/catalog/products?category=slug` | public, or super_admin/marketplace_manager with a token | **Without** a valid admin token: active products only (the storefront). **With** a `super_admin`/`marketplace_manager` token: inactive products included too. Same path/handler either way — branches on whether the request carried a valid token, same pattern as blog's `GET /api/blog/posts` (§12). `?category=` filter applies in both cases |
 | GET | `/api/marketplace/catalog/products/:id` | public, or super_admin/marketplace_manager with a token | Single product. Same admin branch as the list above — an inactive product `404`s without a valid admin token |
-| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §17.9, new code should use that instead |
+| POST | `/api/marketplace/catalog/products/images` | super_admin, marketplace_manager | Upload 1–10 images (`multipart/form-data`, field name `images`, JPEG/PNG/WebP, 5MB max each). Returns `{ "urls": string[] }` — feed those straight into `images` below. Kept as a backward-compatible alias for `/api/uploads/images` — see §18.9, new code should use that instead |
 | POST | `/api/marketplace/catalog/products` | super_admin, marketplace_manager | Body: `{ categoryId, name, description, priceUsd, images: string[], sku, initialStock, lowStockThreshold?, weightKg? }` — `weightKg` (kg per single unit) feeds shipping-fee calculation (§9); omitted/absent is treated as 0kg |
 | PATCH | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | Partial update: `categoryId`, `name`, `description`, `priceUsd`, `images`, `active`, `weightKg` — `categoryId` lets a product move to a different category, e.g. to empty one out before deleting it |
 | DELETE | `/api/marketplace/catalog/products/:id` | super_admin, marketplace_manager | `404` if it doesn't exist. `409` if it has any order history (real orders reference it) — deactivate instead (`PATCH { active: false }`), which already hides it from the storefront without touching order records. A never-ordered product deletes cleanly, its stock row goes with it |
@@ -300,34 +329,53 @@ missing, matching every PaymentIntent created before
 | GET | `/api/marketplace/orders/:id` | public | Order status lookup |
 | GET | `/api/marketplace/orders?status=` | super_admin, marketplace_manager | List orders, optional status filter |
 | PATCH | `/api/marketplace/orders/:id/status` | super_admin, marketplace_manager | Body: `{ status }`. Valid transitions enforced server-side (see §1.5). A `pending → confirmed` transition is verified against Stripe first (§1.5 point 3) rather than trusted outright. A transition to `cancelled`/`returned` from any paid status triggers a full Stripe refund of `total` (§1.5 point 4) |
-| GET | `/api/marketplace/shipping-rates` | public | List the current price-per-kg bands (`{ fromKg, toKg, pricePerKg }[]`), sorted by `fromKg` — checkout needs to price shipping before the customer has any session |
-| PUT | `/api/marketplace/shipping-rates` | super_admin, marketplace_manager | Body: `{ rates: [{ fromKg, toKg, pricePerKg }, ...] }` — **bulk replace** (delete-all-then-recreate in one transaction, not an upsert — rows have no natural stable identity to upsert against, since an admin reconfiguring the bands can freely change how many exist and where they start/end). Returns the full new list |
+| GET | `/api/marketplace/shipping-rates` | public | List the current delivery-charge bands (`{ fromKg, toKg, price }[]`), sorted by `fromKg` — checkout needs to price shipping before the customer has any session |
+| PUT | `/api/marketplace/shipping-rates` | super_admin, marketplace_manager | Body: `{ rates: [{ fromKg, toKg, price }, ...] }` — **bulk replace** (delete-all-then-recreate in one transaction, not an upsert — rows have no natural stable identity to upsert against, since an admin reconfiguring the bands can freely change how many exist and where they start/end). Returns the full new list. Also accepts the old field name `pricePerKg` in place of `price` for one release (`BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md` §2) — drop that fallback once the frontend and backend are both confirmed on `price` |
+
+**`price` is a FLAT delivery charge for an order in that band, not a
+per-kg rate** — bands are exactly 1kg wide (`fromKg == toKg`) in practice,
+so the band already encodes the weight; there is no multiplication by
+weight anywhere in this calculation. This field was named `pricePerKg`
+until `BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md`, and application code
+used to multiply it by the cart weight — the client had filled in "$9.99
+for a 3kg order" and a real order came out as `3 × $9.99 = $29.97`. The
+rename didn't touch stored values; only the (now-removed) multiplication
+was wrong.
 
 **Shipping fee calculation**: `totalWeightKg = Σ(product.weightKg × quantity)`
 across the order's items (a product with no `weightKg` set counts as 0kg),
 rounded **up** to the nearest whole kg, minimum 1kg once the cart is
-non-empty (even an all-0kg cart still gets charged the 1kg band). Band
-selection (`pickShippingRate` in `modules/marketplace/shipping/service.ts`),
-in order:
+non-empty (even an all-0kg cart still gets charged the 1kg band).
+**A `$0` row is treated as "not filled in yet", not "this weight ships
+free"** — the admin grid ships with every band at `$0`, so a still-`$0` row
+is excluded from band selection entirely; if literally no row is priced
+above `$0`, the whole table reads as unconfigured and the fee falls back to
+a flat **$5**, matching the frontend's own `FLAT_SHIPPING_FEE` fallback so
+the checkout preview and the actual charge always agree. Band selection
+among whatever *is* priced above `$0` (`pickShippingRate` in
+`modules/marketplace/shipping/service.ts`), in order:
 
 1. A band that actually contains the weight (`fromKg <= weight <= toKg`) —
-   fee is `weight × that band's pricePerKg`.
-2. Above every band — the band with the **highest `toKg`** prices the
-   excess (not whichever band happens to sort last by `fromKg` — bands can
-   overlap, so those aren't always the same one; see
-   `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §2.2, a bug fix).
-3. In a **gap** between bands (admin-configured bands aren't required to be
-   contiguous) — the *nearest* band strictly below prices it, not just
-   whichever band happens to have the lowest `fromKg` (same §2.2 fix — this
-   used to silently pick whatever the cheapest-or-first-configured band
-   was, regardless of how close it actually was to the real weight).
-4. Below every band's range entirely (e.g. bands start at 2kg) — the
-   lowest band's rate, symmetric with case 2.
+   fee is that band's `price`, unmultiplied.
+2. Above every priced band — the band with the **highest `toKg`** prices
+   the excess (not whichever band happens to sort last by `fromKg` — bands
+   can overlap, so those aren't always the same one; see
+   `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §2.2, a bug fix carried
+   over unchanged by the flat-pricing rename).
+3. In a **gap** between priced bands (admin-configured bands aren't
+   required to be contiguous) — the *nearest* band strictly below prices
+   it, not just whichever band happens to have the lowest `fromKg` (same
+   §2.2 fix — this used to silently pick whatever the cheapest-or-first-
+   configured band was, regardless of how close it actually was to the
+   real weight).
+4. Below every priced band's range entirely (e.g. the lowest priced band
+   starts at 2kg) — the lowest priced band's rate, symmetric with case 2.
 
-If no `ShippingRate` rows are configured at all, the fee is `0` rather than
+If no `ShippingRate` rows are configured at all — or none are priced above
+`$0` — the fee falls back to the flat $5 described above, rather than
 silently trusting a client-sent value (never trusting the client is exactly
 what makes this fee worth computing correctly server-side in the first
-place) or guessing at a fallback constant.
+place) or charging `$0`.
 
 ## 10. Leads — `/api/leads`
 
@@ -409,7 +457,50 @@ Both public carousels fall back to their existing hardcoded reviews if this
 endpoint 404s or returns an empty list, so this shipping is not a breaking
 change for either storefront.
 
-## 14. Admin — `/api/admin`
+## 14. Site content — `/api/content`, `/api/admin/content`
+
+Lets an admin edit the public site's marketing copy and imagery — the
+"Content" admin tab — without a code deploy. See
+`BACKEND_CHANGES_SITE_CONTENT.md` for the full design.
+
+Deliberately a **flat key/value store**, not a schema-per-section design —
+the frontend owns the schema (which keys exist, their type, default, and
+which component renders them, `src/lib/content/schema.ts`); this table only
+stores strings against opaque keys like `italy.hero.title` or
+`global.contact.email`. `key` is never parsed, validated against a known
+list, or rejected for being "unrecognized" — a frontend deploy that adds a
+new key must work against an unchanged backend. **An absent key is how the
+frontend knows to fall back to its own built-in default** — this endpoint
+must never fabricate one.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/content` | public | `[{ key, value }]` for every row that exists — **only** existing rows, never a fabricated default. `[]` is a valid, expected response (nothing edited yet). `Cache-Control: public, max-age=60` — this is on the critical path for every visitor (`ContentProvider` fetches it once on app load), so it's kept fast and cacheable. Must never `5xx`: an outage here must not blank the marketing site, and `ContentProvider` already falls back to defaults on *any* failure — an empty array on a partial read serves that just as well as an error would, so there's no reason to ever produce one |
+| PUT | `/api/admin/content` | super_admin | Upsert. Body: `{ entries: [{ key, value }] }` — **only the keys sent are touched**, every other key is left alone. Returns the saved entries. `value` is capped at 16KB. For a key matching an image/logo/photo naming pattern or under `global.social.*`, `value` (or, for a newline-separated multi-line value, each non-empty line) must be a root-relative path (`/...`) or an `https://` URL, else `400` — see below for why this is a heuristic on the key's *name*, not a fixed list |
+| DELETE | `/api/admin/content` | super_admin | Body: `{ keys: [...] }` — removes keys so the site falls back to defaults. Not currently called by the admin UI ("Restore Defaults" writes the default values explicitly instead, so the field visibly shows what it reverted to) but kept for cleanup |
+
+**Security.** `PUT`/`DELETE` are `super_admin` only, verified against the JWT
+here — not just the frontend's `RequireAdmin` gate, which reads a role out
+of `localStorage` and is trivially bypassed
+(`BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §6.1). This endpoint rewrites
+what every visitor to the site reads, so unverified writes here are a
+defacement vector. Every value is rendered as a plain JSX text child, never
+`dangerouslySetInnerHTML` — stored HTML displays literally rather than
+executing, so no sanitiser is needed on either side **as long as that stays
+true**; if a rich-text editor is ever added here, that guarantee disappears
+and sanitisation becomes mandatory. The URL-shape check above is on top of
+that guarantee, not a substitute for it — recognized by a naming-convention
+heuristic on the key (`/image|photo|logo|^global\.social\./i` in
+`modules/content/validation.ts`) since keys are otherwise opaque; a false
+positive just holds an ordinary text field to a stricter format than it
+needed, a false negative just means one URL field slips this particular
+check — neither is a security hole given the rendering guarantee above.
+
+No seed data: the frontend's `schema.ts` defaults are what a completely
+empty `site_content` table renders as, so a fresh install needs no
+migration and "Restore Defaults" is just a normal `PUT` from the client.
+
+## 15. Admin — `/api/admin`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -422,7 +513,7 @@ change for either storefront.
 | GET | `/api/admin/users` | super_admin | List all admin accounts (`id, email, role, propertyScopeId, createdAt` — never `passwordHash`) |
 | DELETE | `/api/admin/users/:id` | super_admin | Remove an admin account. `400` if you try to delete the account you're currently authenticated as (avoids stranding your own session with no other super_admin to undo it); `404` if the id doesn't exist. No "last super_admin" guard — it's possible to delete every super_admin account, so be deliberate |
 
-## 15. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
+## 16. Guest info requests — `/api/admin/guest-info-template`, `/api/bookings/:id/info-requests`, `/api/booking-info-requests`
 
 Lets an admin send a booked guest a link, by email, to a short form
 collecting whatever extra info is needed before their stay (passport number,
@@ -456,11 +547,11 @@ not by a background job, so nothing needs to run for it to be accurate.
 No customer accounts, no sessions — knowing the token *is* the access
 control, same trust model as `Property.icalExportToken` elsewhere in this
 API. Uploaded documents go to the same S3/R2 bucket as `/api/uploads/images`
-(§17.9), under a `guest-documents/` prefix.
+(§18.9), under a `guest-documents/` prefix.
 
 ---
 
-## 16. Analytics / click heatmaps — `/api/analytics`
+## 17. Analytics / click heatmaps — `/api/analytics`
 
 A Plerdy/Hotjar-style click heatmap: a collector on every public page (never
 `/admin/*`) beacons each click's normalized position back here; the admin
@@ -486,11 +577,11 @@ policy pages first.
 
 ---
 
-## 17. Frontend integration checklist
+## 18. Frontend integration checklist
 
 Things a frontend needs to know that aren't obvious from the endpoint list above.
 
-### 17.1 Stripe publishable keys — not provided by this API
+### 18.1 Stripe publishable keys — not provided by this API
 
 This backend only ever holds Stripe **secret** keys, server-side
 (`STRIPE_ITALY_SECRET_KEY` / `STRIPE_SRILANKA_SECRET_KEY`). To initialize
@@ -505,7 +596,7 @@ publishable/secret key pair (frontend using the wrong account's key) fails
 with a "No such payment_intent" error client-side — the two keys must come
 from the *same* Stripe account.
 
-### 17.2 Confirming payment — use the Payment Element, and pass a `return_url`
+### 18.2 Confirming payment — use the Payment Element, and pass a `return_url`
 
 PaymentIntents are created with `automatic_payment_methods: { enabled: true }`
 (default `allow_redirects: "always"`), so each one's `payment_method_types`
@@ -520,7 +611,7 @@ Dashboard (restrict enabled payment methods) or ask for a backend change to
 set `allow_redirects: "never"` in `payments/service.ts` — not something to
 work around purely in the frontend.
 
-### 17.3 Booking confirmation is asynchronous — poll after `confirmPayment`
+### 18.3 Booking confirmation is asynchronous — poll after `confirmPayment`
 
 `stripe.confirmPayment()` resolving successfully in the browser does **not**
 mean `booking.status` is `confirmed` yet — that only happens once Stripe's
@@ -531,7 +622,7 @@ poll `GET /api/bookings/:id` (e.g. every 1–2s, give up after ~15s) until
 timeout there most likely means the webhook is just running slightly behind,
 not that anything failed — word the UI accordingly rather than showing an error.
 
-### 17.4 The hold has a countdown — show it, and handle expiry gracefully
+### 18.4 The hold has a countdown — show it, and handle expiry gracefully
 
 `POST /api/bookings` returns `booking.expiresAt` (15 minutes out by default,
 `BOOKING_HOLD_MINUTES`). If checkout isn't completed by then, a cron job
@@ -541,7 +632,7 @@ the next poll). Show a visible countdown during checkout, and if payment
 fails after the hold appears to have expired, message it as "your hold
 expired, please start again" rather than a generic payment error.
 
-### 17.5 Two different "room" concepts — check `property.rooms` first
+### 18.5 Two different "room" concepts — check `property.rooms` first
 
 Check `GET /api/properties/:slug`'s `rooms` array (§3) before deciding which
 picker to render — it's non-empty only for a property that's been
@@ -574,21 +665,21 @@ Either way: never compute or send a price yourself — the server always
 derives `totalPrice` itself, from whichever of the two mechanisms applies
 to that property.
 
-### 17.6 Currency is per-property
+### 18.6 Currency is per-property
 
 `property.currency` is `"eur"` for The Nest Bologna and `"usd"` for Dona's
 Villa — format guest-facing prices accordingly (`€` vs `$`), don't hardcode
 one currency site-wide. `Booking.currency` in every booking response always
 matches `property.currency`.
 
-### 17.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
+### 18.7 Dates: send plain `YYYY-MM-DD`, not full ISO timestamps
 
 `checkIn`/`checkOut` are stored as dates only, no time component. Sending a
 full ISO datetime risks the calendar date shifting by a day once converted to
 UTC (e.g. a late-evening Sri Lanka timestamp rolling into the next UTC day).
 Always send plain date strings, e.g. `"2026-08-01"`.
 
-### 17.8 CORS
+### 18.8 CORS
 
 `CORS_ORIGIN` in the backend's `.env` must exactly match the frontend's
 origin (`src/app.ts` → `cors({ origin: env.corsOrigin })`, currently only a
@@ -596,7 +687,7 @@ single origin string, no allowlist). Defaults to `http://localhost:3000` for
 local dev — update it before deploying if the production frontend domain
 differs.
 
-### 17.9 Image upload
+### 18.9 Image upload
 
 `POST /api/uploads/images` is the one shared upload endpoint — used by the
 product catalog, offers, and blog alike. It proxies the upload through this
@@ -609,7 +700,7 @@ gated to one feature.
   `multer`'s `upload.array("images", 10)` on the backend) — up to 10 files,
   5MB each, JPEG/PNG/WebP only. Anything else is rejected with `400` — checked
   against both the declared `Content-Type` and the file's actual magic bytes
-  (same `sniffMimeType` check as the guest-document uploads, §15), so a
+  (same `sniffMimeType` check as the guest-document uploads, §16), so a
   mislabeled file is rejected even if it slips past the frontend's file
   picker filter.
 - Response: `{ "urls": [...] }`, same order as the files were sent.
@@ -646,7 +737,7 @@ feature-specific upload routes going forward.
 
 ---
 
-## 18. Error shape
+## 19. Error shape
 
 ```json
 { "error": "date_conflict", "message": "These dates are no longer available for this property." }
@@ -657,7 +748,7 @@ Validation errors (Zod) return `400` with
 — `path` is dot-joined, prefixed with `body`/`query`/`params` per where the
 field lives in the request.
 
-## 19. Not yet wired (see BACKEND_PLAN.md for context)
+## 20. Not yet wired (see BACKEND_PLAN.md for context)
 
 - WhatsApp transfer confirmations (currently a manual admin action, per plan §11)
 - Government ID-export endpoint for Italy/Sri Lanka compliance filing (data is captured on `Booking`, export route not yet built)
