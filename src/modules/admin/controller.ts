@@ -7,7 +7,12 @@ export async function login(req: Request, res: Response) {
 }
 
 export async function refresh(req: Request, res: Response) {
-  res.json(service.refresh(req.body.refreshToken));
+  res.json(await service.refresh(req.body.refreshToken));
+}
+
+export async function logout(req: Request, res: Response) {
+  await service.logout(req.admin!.sub);
+  res.status(204).send();
 }
 
 export async function createAdminUser(req: Request, res: Response) {

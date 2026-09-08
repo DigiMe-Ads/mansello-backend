@@ -2,16 +2,18 @@ import { Router } from "express";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { requireAuth, requireRole } from "@/middleware/auth";
 import { validate } from "@/middleware/validate";
+import { publicFormLimiter } from "@/middleware/rateLimit";
 import * as controller from "./controller";
 import { subscribeNewsletterSchema } from "./validation";
 
 const router = Router();
 
 // Public — contact form + transport quote request (shared by both sites).
-router.post("/contact", asyncHandler(controller.createContactMessage));
-router.post("/transport-requests", asyncHandler(controller.createTransportRequest));
+router.post("/contact", publicFormLimiter, asyncHandler(controller.createContactMessage));
+router.post("/transport-requests", publicFormLimiter, asyncHandler(controller.createTransportRequest));
 router.post(
   "/newsletter",
+  publicFormLimiter,
   validate(subscribeNewsletterSchema),
   asyncHandler(controller.subscribeToNewsletter)
 );

@@ -1,12 +1,13 @@
 import { Router } from "express";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { requireAuth, requireRole } from "@/middleware/auth";
+import { publicFormLimiter } from "@/middleware/rateLimit";
 import * as controller from "./controller";
 
 const router = Router();
 
-// Public — guest COD checkout.
-router.post("/", asyncHandler(controller.createOrder));
+// Public — guest checkout.
+router.post("/", publicFormLimiter, asyncHandler(controller.createOrder));
 router.get("/:id", asyncHandler(controller.getOrder));
 
 // Admin.

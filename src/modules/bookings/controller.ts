@@ -63,10 +63,29 @@ export async function createOfflineBooking(req: Request, res: Response) {
   res.status(201).json(booking);
 }
 
+// Public, unauthenticated (this route has no requireAuth — the booking
+// confirmation page hits it directly with just the booking id). The id is a
+// random UUIDv4, which is a reasonable secrecy bar for the rest of the
+// booking, but a passport/ID number is meaningfully more sensitive than
+// that bar was ever meant to protect — stripped here regardless of id
+// entropy. See BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §6.2. This is a
+// response-shaping choice, not a service-layer one: bookingService.getBooking
+// is also used by admin-authed callers (cancelBooking, guestInfo's
+// assertBookingScope) that still need the real fields.
+//
+// Also strips two property-internal secrets found during testing of the
+// above (not named in the doc, but the same class of problem): the
+// embedded `property` include carries `icalExportToken` (our own calendar
+// export secret) and `airbnbIcalImportUrls` (each one embeds Airbnb's own
+// per-listing secret token) — neither has any business on a guest-facing
+// booking confirmation, and both would otherwise leak to anyone who learns
+// any booking id for that property.
 export async function getBooking(req: Request, res: Response) {
   const booking = await bookingService.getBooking(req.params.id);
   if (!booking) throw ApiError.notFound("Booking not found");
-  res.json(booking);
+  const { guestIdDocumentType: _type, guestIdDocumentNumber: _number, ...publicBooking } = booking;
+  const { icalExportToken: _icalToken, airbnbIcalImportUrls: _airbnbUrls, ...publicProperty } = publicBooking.property;
+  res.json({ ...publicBooking, property: publicProperty });
 }
 
 export async function listBookings(req: Request, res: Response) {

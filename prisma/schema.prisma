@@ -474,6 +474,17 @@ model AdminUser {
   role            AdminRole
   propertyScopeId String?
   propertyScope   Property? @relation(fields: [propertyScopeId], references: [id])
+  // Embedded in every issued JWT (access + refresh); bumped by POST
+  // /api/admin/logout. A refresh token whose embedded value no longer
+  // matches this is rejected — this is the only real server-side session
+  // revocation this app has, since tokens are otherwise pure stateless
+  // JWTs with no other server-side record. Deliberately checked only in
+  // refresh(), not in requireAuth on every request: an already-issued
+  // access token stays valid for its own short natural lifetime
+  // (JWT_ACCESS_EXPIRES_IN, 15min default) after logout rather than this
+  // adding a DB round-trip to every single authenticated request. See
+  // BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §6.6.
+  tokenVersion    Int       @default(0)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 }

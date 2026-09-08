@@ -1,4 +1,5 @@
 import { prisma } from "@/db/prisma";
+import { isAllowedHeatmapPath } from "./pageAllowlist";
 
 const MAX_EVENTS_PER_REQUEST = 50;
 const VALID_DEVICES = new Set(["desktop", "tablet", "mobile"]);
@@ -25,11 +26,19 @@ interface SanitizedClickEvent {
 // point, never something worth failing loudly over (see
 // BACKEND_CHANGES_HEATMAP_ANALYTICS.md) — so this filters rather than
 // throws, and the caller always responds 202 regardless of what survives.
+//
+// `path` is checked against a server-side allowlist (pageAllowlist.ts), not
+// just accepted verbatim — this endpoint is public and unauthenticated, so
+// without it a caller could store an arbitrary path here, including one
+// carrying a secret (a guest's `/booking-info/<token>` link, a marketplace
+// order id). See BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §1 — that
+// section describes exactly this leak having happened via the frontend
+// tracker (since fixed there too) before this backstop existed.
 function sanitizeEvent(raw: unknown): SanitizedClickEvent | null {
   if (typeof raw !== "object" || raw === null) return null;
   const e = raw as Record<string, unknown>;
 
-  if (typeof e.path !== "string" || e.path.length === 0) return null;
+  if (!isAllowedHeatmapPath(e.path)) return null;
   if (typeof e.xPct !== "number" || !Number.isFinite(e.xPct)) return null;
   if (typeof e.yPct !== "number" || !Number.isFinite(e.yPct)) return null;
   if (typeof e.viewportWidth !== "number" || !Number.isFinite(e.viewportWidth)) return null;
@@ -44,7 +53,8 @@ function sanitizeEvent(raw: unknown): SanitizedClickEvent | null {
 
   return {
     site,
-    path: e.path.slice(0, 2048),
+    // Already validated (shape + length) by isAllowedHeatmapPath above.
+    path: e.path,
     // Never trust the client's own clamp alone.
     xPct: Math.min(1, Math.max(0, e.xPct)),
     yPct: Math.min(1, Math.max(0, e.yPct)),
@@ -135,8 +145,12 @@ export interface HeatmapPageInfo {
 }
 
 // Cosmetic hint for the admin page-picker dropdown (annotates it with click
-// counts) — all-time, all-devices, every path ever seen, not just the
-// frontend's currently-hardcoded list.
+// counts). Filtered through the same allowlist the ingest endpoint enforces
+// — BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §1.4 supersedes this
+// endpoint's original "every path ever seen" design (BACKEND_CHANGES_HEATMAP_ANALYTICS.md):
+// returning every raw path back into the admin UI would surface anything
+// that slipped through before this backstop existed (or any future stored
+// junk) rather than just the pages the heatmap can actually render.
 export async function listHeatmapPages(site?: "italy" | "sri_lanka"): Promise<HeatmapPageInfo[]> {
   const rows = site
     ? await prisma.$queryRaw<{ site: string | null; path: string; clicks: bigint }[]>`
@@ -153,12 +167,14 @@ export async function listHeatmapPages(site?: "italy" | "sri_lanka"): Promise<He
         ORDER BY clicks DESC
       `;
 
-  return rows.map((r) => ({
-    site: r.site as "italy" | "sri_lanka" | null,
-    path: r.path,
-    label: r.path,
-    clicks: Number(r.clicks),
-  }));
+  return rows
+    .filter((r) => isAllowedHeatmapPath(r.path))
+    .map((r) => ({
+      site: r.site as "italy" | "sri_lanka" | null,
+      path: r.path,
+      label: r.path,
+      clicks: Number(r.clicks),
+    }));
 }
 
 // Scheduled retention cleanup (src/jobs) — raw rows are only ever consumed

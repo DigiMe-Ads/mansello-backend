@@ -211,7 +211,7 @@ range like a normal date field.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | POST | `/api/bookings` | public | Start checkout. Body: `{ propertyId, guestName, guestEmail, guestPhone, guestIdDocumentType?, guestIdDocumentNumber?, checkIn, checkOut, guests, rooms?, childrenUnder14?, roomIds? }`. Price is always computed server-side, never taken from the request, **per night** (see below), and branches on whether the property has any `Room` rows configured (§3): **with** rooms (Dona's Villa) — `roomIds` is required (non-empty), every id must belong to this property and be active, their combined `capacity` must cover `guests`; `rooms` is derived from `roomIds.length` server-side, not trusted from the client. **Without** rooms (The Nest Bologna) — unchanged: `rooms` defaults to 1, `400` if no `PricingTier` is configured for that guest/room combo, and `roomIds` must be omitted (`400` if sent). `childrenUnder14` defaults to 0 and `400`s if it exceeds `guests`, same either way. Returns `{ booking, clientSecret }`. `409 date_conflict` if dates (or, for a room-booking, the whole property — see §1.1) just got taken |
-| GET | `/api/bookings/:id` | public | Booking status (poll after Stripe confirmation, or for a "my booking" page) |
+| GET | `/api/bookings/:id` | public | Booking status (poll after Stripe confirmation, or for a "my booking" page). The response strips `guestIdDocumentType`/`guestIdDocumentNumber` (a passport/ID number is more sensitive than the id's UUIDv4 secrecy bar was ever meant to protect) and, on the embedded `property`, `icalExportToken`/`airbnbIcalImportUrls` (property-internal secrets with no reason to reach a guest-facing page) — `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §6.2 and the controller comment. Admin-authed reads of the same booking (cancel, guest-info-request scoping) are unaffected — this stripping happens only in this route's response shaping, not in the underlying service call |
 | GET | `/api/bookings/property/:propertyId?status=` | super_admin, villa_manager (own property) | List bookings, optional status filter |
 | POST | `/api/bookings/offline` | super_admin, villa_manager (own property) | Manual/phone/walk-in booking — same body as above (including the room-booking branch), no Stripe. Created as `paid_offline`. Optional `totalPriceOverride` for a negotiated rate (this overrides `accommodationPrice` only — city tax, when the property has it, is still computed from the standard rate and added on top, since it's a pass-through municipal fee, not part of the negotiated room price); otherwise priced the same way as a direct booking |
 | POST | `/api/bookings/:id/cancel` | super_admin, villa_manager | Body: `{ refundOverride?, reason? }`. Refund defaults to the standard policy (100% ≥7 days out, 50% 3–7 days, 0% <72h) computed off `totalPrice` — which includes city tax, so a full/partial refund refunds the tax portion too (the guest never stayed, so it was never owed to the comune either); triggers a real Stripe refund on the correct account unless `refundOverride` is given |
@@ -296,7 +296,7 @@ missing, matching every PaymentIntent created before
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/marketplace/orders` | public | Guest checkout — card-paid up front (`BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md`), see §1.5. Body: `{ customerName, customerPhone, deliveryAddress, notes?, items: [{ productId, quantity }] }`. Creates the `Order` (`pending`) and a Stripe PaymentIntent on the `sri_lanka` account in one request. Returns `{ order, clientSecret }` — mirrors `POST /api/bookings`'s `CreateBookingResponse` exactly. `shippingFee` is **computed server-side** from the items' weight and the current `ShippingRate` table (below) — never taken from the request |
+| POST | `/api/marketplace/orders` | public, rate-limited (20/10min/IP) | Guest checkout — card-paid up front (`BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md`), see §1.5. Body: `{ customerName, customerPhone, deliveryAddress, notes?, items: [{ productId, quantity }] }`. Creates the `Order` (`pending`) and a Stripe PaymentIntent on the `sri_lanka` account in one request. Returns `{ order, clientSecret }` — mirrors `POST /api/bookings`'s `CreateBookingResponse` exactly. `shippingFee` is **computed server-side** from the items' weight and the current `ShippingRate` table (below) — never taken from the request, regardless of what the body sends |
 | GET | `/api/marketplace/orders/:id` | public | Order status lookup |
 | GET | `/api/marketplace/orders?status=` | super_admin, marketplace_manager | List orders, optional status filter |
 | PATCH | `/api/marketplace/orders/:id/status` | super_admin, marketplace_manager | Body: `{ status }`. Valid transitions enforced server-side (see §1.5). A `pending → confirmed` transition is verified against Stripe first (§1.5 point 3) rather than trusted outright. A transition to `cancelled`/`returned` from any paid status triggers a full Stripe refund of `total` (§1.5 point 4) |
@@ -306,28 +306,40 @@ missing, matching every PaymentIntent created before
 **Shipping fee calculation**: `totalWeightKg = Σ(product.weightKg × quantity)`
 across the order's items (a product with no `weightKg` set counts as 0kg),
 rounded **up** to the nearest whole kg, minimum 1kg once the cart is
-non-empty (even an all-0kg cart still gets charged the 1kg band). Find the
-`ShippingRate` row where `fromKg <= totalWeightKg <= toKg`; the fee is
-`totalWeightKg × that row's pricePerKg` — the *whole* weight at that one
-band's rate, not a blend across bands. If the rounded weight exceeds every
-row's `toKg`, the highest row's `pricePerKg` prices the excess (symmetrically,
-a weight below every row's `fromKg` uses the lowest row's rate) — there's no
-data to price it any other way until the admin adds more rows. If no
-`ShippingRate` rows are configured at all, the fee is `0` rather than
-silently trusting a client-sent value (the trust gap being closed above) or
-guessing at a fallback constant.
+non-empty (even an all-0kg cart still gets charged the 1kg band). Band
+selection (`pickShippingRate` in `modules/marketplace/shipping/service.ts`),
+in order:
+
+1. A band that actually contains the weight (`fromKg <= weight <= toKg`) —
+   fee is `weight × that band's pricePerKg`.
+2. Above every band — the band with the **highest `toKg`** prices the
+   excess (not whichever band happens to sort last by `fromKg` — bands can
+   overlap, so those aren't always the same one; see
+   `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §2.2, a bug fix).
+3. In a **gap** between bands (admin-configured bands aren't required to be
+   contiguous) — the *nearest* band strictly below prices it, not just
+   whichever band happens to have the lowest `fromKg` (same §2.2 fix — this
+   used to silently pick whatever the cheapest-or-first-configured band
+   was, regardless of how close it actually was to the real weight).
+4. Below every band's range entirely (e.g. bands start at 2kg) — the
+   lowest band's rate, symmetric with case 2.
+
+If no `ShippingRate` rows are configured at all, the fee is `0` rather than
+silently trusting a client-sent value (never trusting the client is exactly
+what makes this fee worth computing correctly server-side in the first
+place) or guessing at a fallback constant.
 
 ## 10. Leads — `/api/leads`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/leads/contact` | public | Contact form. Body: `{ site: "italy"|"sri_lanka", name, email, subject: "room_booking"|"airport_transfer"|"marketplace"|"other", message }` |
-| POST | `/api/leads/transport-requests` | public | Transport quote/booking. Body: `{ propertyId?, bookingId?, type: "fixed_price"|"custom_quote", date, flightNumber?, passengers, contactName, contactEmail, contactPhone, notes? }`. `bookingId` is optional — set when submitted as an add-on during villa booking checkout (see `BACKEND_CHANGES_BOOKING_TRANSPORT.md`), omitted for standalone requests from the Transport page. Not validated against `propertyId`. |
+| POST | `/api/leads/contact` | public, rate-limited (20/10min/IP) | Contact form. Body: `{ site: "italy"|"sri_lanka", name, email, subject: "room_booking"|"airport_transfer"|"marketplace"|"other", message }` |
+| POST | `/api/leads/transport-requests` | public, rate-limited (20/10min/IP) | Transport quote/booking. Body: `{ propertyId?, bookingId?, type: "fixed_price"|"custom_quote", date, flightNumber?, passengers, contactName, contactEmail, contactPhone, notes? }`. `bookingId` is optional — set when submitted as an add-on during villa booking checkout (see `BACKEND_CHANGES_BOOKING_TRANSPORT.md`), omitted for standalone requests from the Transport page. Not validated against `propertyId`. |
 | GET | `/api/leads/contact?status=` | any admin role | Inbox |
 | PATCH | `/api/leads/contact/:id/status` | any admin role | Body: `{ status: "new"|"read"|"responded" }` |
 | GET | `/api/leads/transport-requests?status=` | any admin role | Inbox. Each row includes `bookingId` (nullable). |
 | PATCH | `/api/leads/transport-requests/:id/status` | any admin role | Body: `{ status }` |
-| POST | `/api/leads/newsletter` | public | Body: `{ email, site: "italy"|"sri_lanka" }`. `201` on success, `409` if that email is already subscribed *for that site* (subscribing to both sites independently is fine — same email, different `site`, no conflict) |
+| POST | `/api/leads/newsletter` | public, rate-limited (20/10min/IP) | Body: `{ email, site: "italy"|"sri_lanka" }`. `201` on success, `409` if that email is already subscribed *for that site* (subscribing to both sites independently is fine — same email, different `site`, no conflict) |
 | GET | `/api/leads/newsletter?site=` | any admin role | List subscribers, optional site filter |
 
 ## 11. Offers — `/api/offers`
@@ -401,8 +413,9 @@ change for either storefront.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/admin/login` | public | Body: `{ email, password }` → `{ admin, accessToken, refreshToken }` |
-| POST | `/api/admin/refresh` | public | Body: `{ refreshToken }` → new token pair |
+| POST | `/api/admin/login` | public | Body: `{ email, password }` → `{ admin, accessToken, refreshToken }`. Rate-limited: 5 attempts / 15min / IP (`429` beyond that, `src/middleware/rateLimit.ts`) — counts failed and successful attempts alike |
+| POST | `/api/admin/refresh` | public | Body: `{ refreshToken }` → new token pair. `401` if the account has been logged out since this refresh token was issued (see `POST /logout`) |
+| POST | `/api/admin/logout` | any admin | No body. Invalidates every refresh token issued before this call for the calling admin (bumps `AdminUser.tokenVersion` — the only server-side session record this app keeps, since tokens are otherwise stateless JWTs) — the closest thing to "log out everywhere" available without moving off stateless JWTs. Deliberately does **not** invalidate the access token used to call it (or any other still-live access token for that admin) — those keep working for their own remaining natural lifetime (`JWT_ACCESS_EXPIRES_IN`, 15min default); only future `POST /refresh` calls are affected. See `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §6.6 |
 | GET | `/api/admin/me` | any admin | Current admin identity from the access token |
 | GET | `/api/admin/dashboard` | any admin | Upcoming check-ins/outs (next 7 days), revenue per property, low-stock count, pending-orders count |
 | POST | `/api/admin/users` | super_admin | Create an admin account. Body: `{ email, password, role, propertyScopeId? }` — there is no public signup route |
@@ -437,8 +450,8 @@ not by a background job, so nothing needs to run for it to be accurate.
 | POST | `/api/bookings/:id/info-requests` | super_admin, villa_manager (own property) | Creates a `BookingInfoRequest`: snapshots the current template's `fields`, generates a `token`, sets a 14-day `expiresAt`, and emails the guest. Returns the created row **including `token`/`link`** — the admin UI's "Copy Link" button uses it as a manual fallback (WhatsApp etc.) if the email doesn't land. `404` if the booking doesn't exist; `403` if a villa_manager doesn't own its property |
 | GET | `/api/bookings/:id/info-requests` | super_admin, villa_manager (own property) | Lists all requests for this booking, most recent first (more than one if the admin re-sent). Same scoping as `POST` |
 | GET | `/api/booking-info-requests/:token` | public | Everything the guest-facing form needs in one call: `{ status, propertyName, guestName, checkIn, checkOut, fields, expiresAt }`. `404` if the token doesn't exist at all; a lapsed-but-real token still returns `200` with `status: "expired"` (a friendly message, not a hard error) — the token/link itself is never echoed back here, there's nothing to expose |
-| POST | `/api/booking-info-requests/:token/uploads` | public | Multipart body, files under a repeatable `files` field. Uploads immediately as the guest picks a file, before submit (same UX as the admin product-image dropzone) — not bundled as raw bytes into the `submit` payload below. Returns `{ urls: string[] }`; feed those into the matching `"file"` field's answer. JPEG/PNG/WebP/PDF only, 10MB/file, enforced server-side regardless of the frontend's `accept` attribute. Same status gating as `submit`: `404` unknown token, `409` if already submitted, `410` if expired |
-| POST | `/api/booking-info-requests/:token/submit` | public | Body: `{ answers: { [fieldId]: string \| boolean \| string[] } }` — a `"file"` field's answer is the `urls` array from the uploads endpoint above. Every `required` field (per the row's own snapshotted `fields`) must have a non-empty answer (a non-empty array counts, for `"file"`), else `400`. On success: stores `answers`, sets `status: "submitted"`. `404` unknown token, `409` if already submitted, `410` if expired |
+| POST | `/api/booking-info-requests/:token/uploads` | public, rate-limited (20/10min/IP) | Multipart body, files under a repeatable `files` field. Uploads immediately as the guest picks a file, before submit (same UX as the admin product-image dropzone) — not bundled as raw bytes into the `submit` payload below. Returns `{ urls: string[] }`; feed those into the matching `"file"` field's answer. JPEG/PNG/WebP/PDF only, 10MB/file — checked two ways: the declared `Content-Type` (fast pre-filter) *and* the file's actual magic bytes (`sniffMimeType` in `modules/uploads/imageUpload.ts`), which must agree, so a relabeled/disguised file is rejected even though the frontend's `accept` attribute alone wouldn't have caught it (drag-and-drop bypasses that). This is the one upload endpoint that receives passport scans, so it's rate-limited same as the other public forms. Same status gating as `submit`: `404` unknown token, `409` if already submitted, `410` if expired |
+| POST | `/api/booking-info-requests/:token/submit` | public, rate-limited (20/10min/IP) | Body: `{ answers: { [fieldId]: string \| boolean \| string[] } }` — a `"file"` field's answer is the `urls` array from the uploads endpoint above. Every `required` field (per the row's own snapshotted `fields`) must have a non-empty answer (a non-empty array counts, for `"file"`), else `400`. On success: stores `answers`, sets `status: "submitted"`. `404` unknown token, `409` if already submitted, `410` if expired |
 
 No customer accounts, no sessions — knowing the token *is* the access
 control, same trust model as `Property.icalExportToken` elsewhere in this
@@ -458,9 +471,9 @@ raw `ClickEvent` schema.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/analytics/click-events` | public, rate-limited (300/min/IP) | High-volume, fire-and-forget ingest — hit directly by every visitor's browser (`sendBeacon`/`fetch`, not `authedFetch`), never `authedFetch`'d. Body: `{ events: [{ site?, path, xPct, yPct, viewportWidth, device, sessionId, targetSelector?, occurredAt }] }`, up to 50 events per request (extra ones are silently truncated, not rejected). `xPct`/`yPct` are clamped server-side to `[0, 1]` regardless of what the client sends. **Always responds `202`**, even for a malformed event, an over-the-rate-limit request, or a request whose `Origin`/`Referer` doesn't match this site's own domains — a real visitor's browser must never see an error here, and there's nothing it could do about one anyway. A rejected/malformed event is just silently not recorded, never surfaced |
+| POST | `/api/analytics/click-events` | public, rate-limited (300/min/IP) | High-volume, fire-and-forget ingest — hit directly by every visitor's browser (`sendBeacon`/`fetch`, not `authedFetch`), never `authedFetch`'d. Body: `{ events: [{ site?, path, xPct, yPct, viewportWidth, device, sessionId, targetSelector?, occurredAt }] }`, up to 50 events per request (extra ones are silently truncated, not rejected). `xPct`/`yPct` are clamped server-side to `[0, 1]` regardless of what the client sends. `path` is checked against a server-side allowlist (`modules/analytics/pageAllowlist.ts`) — anything not shaped like one of the site's known static pages is silently dropped, most importantly anything matching `/booking-info/*`, `/admin*`, or `/sri-lanka/marketplace/order/*` (never storable, unconditionally, regardless of the allowlist). See `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §1 — a real guest-token leak into this table via the *frontend* tracker (since fixed there too) is what prompted this; the live table was checked and found clean (no leaked rows, no purge needed) before this backstop shipped. **Always responds `202`**, even for a malformed/disallowed event, an over-the-rate-limit request, or a request whose `Origin`/`Referer` doesn't match this site's own domains — a real visitor's browser must never see an error here, and there's nothing it could do about one anyway. A rejected/malformed event is just silently not recorded, never surfaced |
 | GET | `/api/analytics/heatmap?path=&device=&from=&to=` | `super_admin` | `path` required; `device` is `all` (default) \| `desktop` \| `tablet` \| `mobile`; `from`/`to` are `YYYY-MM-DD`, inclusive on both ends. Aggregates `ClickEvent` rows at read time (no separate rollup table — traffic here doesn't warrant one yet) into a 100×100 grid (`xPct`/`yPct` rounded to 2 decimals) matching the resolution the frontend's canvas renderer expects. Returns `{ site, path, device, from, to, totalClicks, totalPageViews, maxWeight, points: [{ xPct, yPct, weight }] }` — `totalPageViews` is `count(distinct sessionId)` in range (a "page view" here means a distinct visiting session, not a separate pageview-tracking system), `maxWeight` is the highest single point's weight, for the frontend to normalize color/opacity against |
-| GET | `/api/analytics/heatmap/pages?site=` | `super_admin` | Every distinct `path` seen so far (optionally filtered to one `site`), with an all-time, all-device click count — purely cosmetic, annotates the admin page-picker dropdown. `{ site, path, label, clicks }[]`, `label` just echoes `path` |
+| GET | `/api/analytics/heatmap/pages?site=` | `super_admin` | Every distinct `path` seen so far (optionally filtered to one `site`) that passes the same allowlist as the ingest endpoint above — **not** literally every path ever stored, which is what this originally returned (`BACKEND_CHANGES_HEATMAP_ANALYTICS.md`); superseded by `BACKEND_CHANGES_SEO_SECURITY_HARDENING.md` §1.4, since surfacing an unfiltered path list back into the admin UI is itself a risk (see `heatmap-viewer.tsx`'s iframe-src construction) — with an all-time, all-device click count, purely cosmetic, annotates the admin page-picker dropdown. `{ site, path, label, clicks }[]`, `label` just echoes `path` |
 
 `ClickEvent` rows are deleted once they're older than **180 days** by a
 daily cron job (`src/jobs/clickEventRetention.ts`) — raw rows are only ever
@@ -594,7 +607,11 @@ gated to one feature.
 
 - Send `multipart/form-data`, **field name must be `images`** (matches
   `multer`'s `upload.array("images", 10)` on the backend) — up to 10 files,
-  5MB each, JPEG/PNG/WebP only. Anything else is rejected with `400`.
+  5MB each, JPEG/PNG/WebP only. Anything else is rejected with `400` — checked
+  against both the declared `Content-Type` and the file's actual magic bytes
+  (same `sniffMimeType` check as the guest-document uploads, §15), so a
+  mislabeled file is rejected even if it slips past the frontend's file
+  picker filter.
 - Response: `{ "urls": [...] }`, same order as the files were sent.
 - Feed the returned URLs straight into whichever feature's `imageUrl` /
   `coverImageUrl` / `images` field — upload first (e.g. as the admin

@@ -26,17 +26,43 @@ export async function login(email: string, password: string) {
     sub: admin.id,
     role: admin.role,
     propertyScopeId: admin.propertyScopeId,
+    tokenVersion: admin.tokenVersion,
   };
   return { admin: { id: admin.id, email: admin.email, role: admin.role }, ...signTokens(payload) };
 }
 
-export function refresh(refreshToken: string) {
+// Now async and DB-backed (it wasn't before) — needs the admin's *current*
+// tokenVersion to detect a logged-out session, which a pure JWT-signature
+// check can't express on its own. See BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §6.6.
+export async function refresh(refreshToken: string) {
+  let payload: AdminJwtPayload;
   try {
-    const payload = jwt.verify(refreshToken, env.jwtRefreshSecret) as AdminJwtPayload;
-    return signTokens({ sub: payload.sub, role: payload.role, propertyScopeId: payload.propertyScopeId });
+    payload = jwt.verify(refreshToken, env.jwtRefreshSecret) as AdminJwtPayload;
   } catch {
     throw ApiError.unauthorized("Invalid or expired refresh token");
   }
+
+  const admin = await prisma.adminUser.findUnique({ where: { id: payload.sub } });
+  if (!admin || admin.tokenVersion !== payload.tokenVersion) {
+    throw ApiError.unauthorized("Session has been signed out — please log in again");
+  }
+
+  return signTokens({
+    sub: admin.id,
+    role: admin.role,
+    propertyScopeId: admin.propertyScopeId,
+    tokenVersion: admin.tokenVersion,
+  });
+}
+
+// Invalidates every refresh token issued before this call (they carry the
+// old tokenVersion) — the closest thing to real "log out everywhere" this
+// app has, short of moving off stateless JWTs entirely. Already-issued
+// *access* tokens are unaffected and keep working for their own remaining
+// ≤15min lifetime — see the tokenVersion schema comment for why that's a
+// deliberate trade-off, not an oversight.
+export async function logout(adminId: string) {
+  await prisma.adminUser.update({ where: { id: adminId }, data: { tokenVersion: { increment: 1 } } });
 }
 
 export async function getDashboard() {

@@ -1,12 +1,14 @@
 import { Router } from "express";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { requireAuth, requireRole } from "@/middleware/auth";
+import { loginLimiter } from "@/middleware/rateLimit";
 import * as controller from "./controller";
 
 const router = Router();
 
-router.post("/login", asyncHandler(controller.login));
+router.post("/login", loginLimiter, asyncHandler(controller.login));
 router.post("/refresh", asyncHandler(controller.refresh));
+router.post("/logout", requireAuth, asyncHandler(controller.logout));
 
 router.get("/me", requireAuth, asyncHandler(controller.me));
 router.get("/dashboard", requireAuth, asyncHandler(controller.getDashboard));

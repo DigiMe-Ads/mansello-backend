@@ -3,6 +3,7 @@ import multer from "multer";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { requireAuth, requireRole } from "@/middleware/auth";
 import { validate } from "@/middleware/validate";
+import { publicFormLimiter } from "@/middleware/rateLimit";
 import * as controller from "./controller";
 import { updateGuestInfoTemplateSchema, submitBookingInfoRequestSchema } from "./validation";
 
@@ -53,15 +54,18 @@ export const publicRoutes = Router();
 publicRoutes.get("/:token", asyncHandler(controller.getByToken));
 publicRoutes.post(
   "/:token/submit",
+  publicFormLimiter,
   validate(submitBookingInfoRequestSchema),
   asyncHandler(controller.submitByToken)
 );
 // Immediate upload on file selection, before submit — files under a
 // repeatable "files" field. JPEG/PNG/WebP/PDF only, 10MB/file — enforced in
 // modules/uploads/imageUpload.ts's uploadDocument, not just the frontend's
-// <input accept>.
+// <input accept>. Rate-limited: unauthenticated, and the one upload
+// endpoint that receives passport scans (BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §6.4).
 publicRoutes.post(
   "/:token/uploads",
+  publicFormLimiter,
   uploadDocuments.array("files", 10),
   asyncHandler(controller.uploadFiles)
 );

@@ -9,6 +9,10 @@ export interface AdminJwtPayload {
   sub: string; // admin user id
   role: AdminRole;
   propertyScopeId: string | null;
+  // Checked against AdminUser.tokenVersion, but only by refresh() — not by
+  // requireAuth on every request. See the schema comment on tokenVersion
+  // and BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §6.6.
+  tokenVersion: number;
 }
 
 declare global {

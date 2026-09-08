@@ -49,13 +49,48 @@ export async function computeShippingFee(
   // closing) or guessing at a fallback constant this module doesn't own.
   if (rates.length === 0) return 0;
 
-  const matched = rates.find((r) => roundedWeightKg >= r.fromKg && roundedWeightKg <= r.toKg);
-  // Exceeds every configured band's toKg — use the highest band's
-  // pricePerKg for the excess, per the doc (no data to price it any other
-  // way until the admin adds more rows). Symmetrically, a weight below
-  // every band's fromKg (e.g. bands start at 2kg) uses the lowest band's
-  // rate rather than going unpriced.
-  const rate = matched ?? (roundedWeightKg > rates[rates.length - 1].toKg ? rates[rates.length - 1] : rates[0]);
-
+  const rate = pickShippingRate(roundedWeightKg, rates);
   return roundedWeightKg * Number(rate.pricePerKg);
+}
+
+interface ShippingRateRow {
+  fromKg: number;
+  toKg: number;
+  pricePerKg: unknown;
+}
+
+// BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §2.2 — two bugs fixed here,
+// both only reachable with admin-configured bands that aren't a single
+// contiguous, non-overlapping run (freely possible via replaceShippingRates,
+// so a realistic data-entry outcome, not a hypothetical):
+//
+// (a) A weight in a *gap* between bands (e.g. bands 1–3kg and 6–10kg, a 4kg
+//     order) used to fall through to `rates[0]` — whichever band happens to
+//     have the lowest fromKg — instead of the nearest band actually below
+//     it. Now: the nearest band whose toKg is still < the weight.
+// (b) "Is this weight above every band?" used to compare against
+//     `rates[rates.length - 1]` — since `rates` is sorted by fromKg, that's
+//     the band that *starts* highest, not necessarily the one that *ends*
+//     highest (overlapping bands can disagree on those). Now: the band with
+//     the highest toKg, found explicitly rather than assumed from sort order.
+export function pickShippingRate(roundedKg: number, rates: ShippingRateRow[]): ShippingRateRow {
+  // 1. A band that actually contains this weight.
+  const exact = rates.find((r) => roundedKg >= r.fromKg && roundedKg <= r.toKg);
+  if (exact) return exact;
+
+  // 2. Above every band — the band with the highest toKg (fix (b)) prices
+  //    the excess; there's no data to price it any other way.
+  const top = rates.reduce((max, r) => (r.toKg > max.toKg ? r : max), rates[0]);
+  if (roundedKg > top.toKg) return top;
+
+  // 3. In a gap between bands — the nearest band strictly below (fix (a)),
+  //    not just whichever band sorts first.
+  const below = rates.filter((r) => r.toKg < roundedKg);
+  if (below.length > 0) {
+    return below.reduce((nearest, r) => (r.toKg > nearest.toKg ? r : nearest), below[0]);
+  }
+
+  // 4. Below every band's range entirely (e.g. bands start at 2kg) — the
+  //    lowest band's rate, symmetric with case 2.
+  return rates.reduce((min, r) => (r.fromKg < min.fromKg ? r : min), rates[0]);
 }
