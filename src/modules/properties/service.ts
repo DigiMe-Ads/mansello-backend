@@ -64,6 +64,7 @@ export function updateProperty(
     checkOutTime: string;
     airbnbIcalImportUrls: string[];
     transportEnabled: boolean;
+    maxGuests: number;
     // See BACKEND_CHANGES_ICAL_MINUS_ONE_DAY.md — deliberately toggleable
     // with no deploy, since two properties can reasonably want different
     // answers, and it should only ever be flipped after confirming a

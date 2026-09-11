@@ -62,3 +62,27 @@ export function listNewsletterSubscribers(site?: string) {
     orderBy: { subscribedAt: "desc" },
   });
 }
+
+// "Can't find it in the catalog?" lead — a request for a price quote, not a
+// purchase; nothing here touches the cart or checkout. See
+// BACKEND_CHANGES_ADMIN_CONTENT_REQUESTS.md §1.
+export function createCustomOrderRequest(input: {
+  site?: "italy" | "sri_lanka";
+  name: string;
+  email: string;
+  itemDescription: string;
+  notes?: string;
+}) {
+  return prisma.customOrderRequest.create({ data: input });
+}
+
+export function listCustomOrderRequests(status?: string) {
+  return prisma.customOrderRequest.findMany({
+    where: status ? { status: status as never } : {},
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+export function updateCustomOrderRequestStatus(id: string, status: "new" | "read" | "responded") {
+  return prisma.customOrderRequest.update({ where: { id }, data: { status } });
+}

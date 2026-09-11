@@ -34,3 +34,15 @@ export async function subscribeToNewsletter(req: Request, res: Response) {
 export async function listNewsletterSubscribers(req: Request, res: Response) {
   res.json(await service.listNewsletterSubscribers(req.query.site as string | undefined));
 }
+
+export async function createCustomOrderRequest(req: Request, res: Response) {
+  res.status(201).json(await service.createCustomOrderRequest(req.body));
+}
+
+export async function listCustomOrderRequests(req: Request, res: Response) {
+  res.json(await service.listCustomOrderRequests(req.query.status as string | undefined));
+}
+
+export async function updateCustomOrderRequestStatus(req: Request, res: Response) {
+  res.json(await service.updateCustomOrderRequestStatus(req.params.id, req.body.status));
+}

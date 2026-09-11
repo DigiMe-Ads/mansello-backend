@@ -121,19 +121,18 @@ model Property {
   cityTaxMaxNights      Int              @default(5) // nights beyond this aren't taxed — the room price still is
   cityTaxExemptAgeUnder Int              @default(14) // guests younger than this pay no tax
   cityTaxBands          Json             @default("[]") // CityTaxBand[] — { minPricePerPersonPerNight, maxPricePerPersonPerNight: number | null, ratePerPersonPerNight }[], sorted ascending
-  // Priced airport-transfer add-on — a property-wide kill switch, separate
+  // Priced airport-transfer add-on — a property-wide master switch, separate
   // from each TransportRate row's own `active` flag (that's "no vehicle for
-  // this party size"; this is "we don't offer this at all"). Defaults
-  // `true`, NOT `false` — there is no admin UI control for this field at
-  // all (the Transport tab only edits per-guest-count `active`/`price`
-  // rows), so `false` would silently strand the whole feature off forever
-  // with no way to switch it back on short of a direct DB write. The real
-  // "off by default" behavior for an unconfigured property already comes
-  // from every TransportRate row's own `active` defaulting to `false` — see
-  // BACKEND_CHANGES_VILLA_TRANSPORT.md §2, which explicitly warns about
-  // this exact trap. Kept (rather than dropped) as a server-side-only kill
-  // switch someone could still flip by hand if ever needed.
-  transportEnabled      Boolean          @default(true)
+  // this party size"; this is "we don't offer this at all", checked first
+  // by the frontend before it even looks at the rates). Defaults `false`:
+  // an untouched property should not surface the add-on. This flipped back
+  // from an earlier `true` default (see git history) once the villa
+  // admin's Transport tab shipped a real master on/off switch
+  // (`PATCH /api/properties/:propertyId { transportEnabled }`) — the risk
+  // that justified defaulting `true` (no way to turn it back on) no longer
+  // applies now that a client can just flip it themselves. See
+  // BACKEND_CHANGES_VILLA_TRANSPORT.md §2 (this revision).
+  transportEnabled      Boolean          @default(false)
   // Whether the Airbnb import keeps today's padded checkout-day behavior
   // (true, the default) or trims the imported block's end date back by one
   // day (false) — see BACKEND_CHANGES_ICAL_MINUS_ONE_DAY.md. Named for what
@@ -474,6 +473,22 @@ model NewsletterSubscriber {
   subscribedAt DateTime @default(now())
 
   @@unique([email, site])
+}
+
+// "Can't find it in the catalog?" lead form on the marketplace — a request
+// for a price quote on an item not currently sold, not a purchase. Same
+// shape as ContactMessage above; `site` defaults to sri_lanka since the
+// marketplace only exists there today, but is kept (not hardcoded) in case
+// it ever serves Italy too. See BACKEND_CHANGES_ADMIN_CONTENT_REQUESTS.md §1.
+model CustomOrderRequest {
+  id              String     @id @default(uuid())
+  site            Site       @default(sri_lanka)
+  name            String
+  email           String
+  itemDescription String
+  notes           String?
+  status          LeadStatus @default(new)
+  createdAt       DateTime   @default(now())
 }
 
 // At most one active offer per property is enforced at the application
