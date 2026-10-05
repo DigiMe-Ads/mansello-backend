@@ -19,6 +19,9 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
   if (err instanceof ApiError) {
     return res.status(err.status).json({
       error: err.message,
+      // Same text again under `message`, the key the frontend shows to the
+      // user (and what every other error shape here already uses).
+      message: err.message,
       details: err.details,
     });
   }

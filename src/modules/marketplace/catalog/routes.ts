@@ -2,6 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { requireAuth, requireRole, optionalAuth } from "@/middleware/auth";
+import { reviewLimiter } from "@/middleware/rateLimit";
 import * as controller from "./controller";
 
 const router = Router();
@@ -20,6 +21,11 @@ router.get("/categories", asyncHandler(controller.listCategories));
 router.get("/products", optionalAuth, asyncHandler(controller.listProducts));
 router.get("/products/:id", optionalAuth, asyncHandler(controller.getProduct));
 
+// Public — product reviews (no auth). Reviews publish immediately; spam is
+// removed with the admin DELETE below.
+router.get("/products/:id/reviews", asyncHandler(controller.listReviews));
+router.post("/products/:id/reviews", reviewLimiter, asyncHandler(controller.createReview));
+
 // Admin — marketplace_manager or super_admin.
 const manager = [requireAuth, requireRole("super_admin", "marketplace_manager")] as const;
 router.post("/categories", ...manager, asyncHandler(controller.createCategory));
@@ -31,5 +37,6 @@ router.patch("/products/:id", ...manager, asyncHandler(controller.updateProduct)
 router.delete("/products/:id", ...manager, asyncHandler(controller.deleteProduct));
 router.post("/products/:id/stock-adjustment", ...manager, asyncHandler(controller.adjustStock));
 router.get("/low-stock", ...manager, asyncHandler(controller.listLowStock));
+router.delete("/reviews/:id", ...manager, asyncHandler(controller.deleteReview));
 
 export default router;

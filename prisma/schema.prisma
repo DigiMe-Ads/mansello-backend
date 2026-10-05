@@ -28,6 +28,7 @@ enum AvailabilitySource {
   direct
   airbnb
   manual
+  booking_com // iCal import from ical.booking.com — anything else unrecognised stays `airbnb`
 }
 
 enum BlockStatus {
@@ -111,7 +112,8 @@ model Property {
   airbnbIcalImportUrls  String[]         @default([]) // Airbnb "Export Calendar" URLs we poll — a property
   // can be double/triple-listed on Airbnb (e.g. whole villa + individual rooms sold
   // separately), each with its own feed; all of them feed into this one property's
-  // shared AvailabilityBlock pool. Booking.com feeds go in here too once obtained.
+  // shared AvailabilityBlock pool. Channel-agnostic despite the name: Booking.com
+  // feeds go in here too (the source is detected per feed in jobs/airbnbSync.ts).
   icalExportToken       String           @unique @default(uuid()) // used to build our own export feed URL
   // Bologna municipal tourist tax (imposta di soggiorno) — a per-property
   // on/off switch, not hardcoded to one slug. Dona's Villa (Sri Lanka) has
@@ -143,6 +145,11 @@ model Property {
   // after confirming its own feed actually pads, never flip this without
   // that confirmation first.
   icalCheckoutDayBuffer Boolean          @default(true)
+  // Last sync outcome per import URL, written by jobs/airbnbSync.ts so the
+  // admin can spot a broken feed: { url, lastSyncedAt, lastSyncError }[].
+  // lastSyncedAt is the last *successful* fetch; lastSyncError is null once
+  // a feed recovers.
+  icalImportStatus      Json             @default("[]")
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt
 
@@ -367,7 +374,14 @@ model Category {
   description String? // short blurb for the storefront's featured section
   imageUrl    String?
   featured    Boolean   @default(false) // at most 4 across all categories, enforced in modules/marketplace/catalog/service.ts
+  // One level of nesting only — a subcategory's parent is always top-level,
+  // enforced in modules/marketplace/catalog/service.ts.
+  parentId    String?
+  parent      Category?  @relation("CategoryChildren", fields: [parentId], references: [id], onDelete: Restrict)
+  children    Category[] @relation("CategoryChildren")
   products    Product[]
+
+  @@index([parentId])
 }
 
 model Product {
@@ -375,7 +389,7 @@ model Product {
   categoryId  String
   category    Category @relation(fields: [categoryId], references: [id])
   name        String
-  description String
+  description String // sanitized HTML subset (see utils/richText.ts) — or legacy plain text
   priceUsd    Decimal  @db.Decimal(10, 2)
   images      String[]
   sku         String   @unique
@@ -386,6 +400,22 @@ model Product {
 
   stockLevel StockLevel?
   orderItems OrderItem[]
+  reviews    ProductReview[]
+}
+
+// Public storefront reviews — publish immediately (no moderation queue yet),
+// spam removed via DELETE /api/marketplace/catalog/reviews/:id.
+model ProductReview {
+  id         String   @id @default(uuid())
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  authorName String   @db.VarChar(80)
+  rating     Int // 1–5
+  comment    String // plain text, never rendered as HTML
+  ipHash     String? // salted hash of the poster's IP, for per-product rate limiting — never returned
+  createdAt  DateTime @default(now())
+
+  @@index([productId, createdAt])
 }
 
 // Small, admin-managed global table (not per-product) — a price-per-kg band

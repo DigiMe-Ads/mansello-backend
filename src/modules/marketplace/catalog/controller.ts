@@ -68,3 +68,16 @@ export async function adjustStock(req: Request, res: Response) {
 export async function listLowStock(_req: Request, res: Response) {
   res.json(await service.listLowStock());
 }
+
+export async function listReviews(req: Request, res: Response) {
+  res.json(await service.listReviews(req.params.id));
+}
+
+export async function createReview(req: Request, res: Response) {
+  res.status(201).json(await service.createReview(req.params.id, req.body ?? {}, req.ip));
+}
+
+export async function deleteReview(req: Request, res: Response) {
+  await service.deleteReview(req.params.id);
+  res.status(204).send();
+}

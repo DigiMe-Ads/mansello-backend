@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { ApiError } from "@/utils/ApiError";
 import * as service from "./service";
 
 export async function listBlocks(req: Request, res: Response) {
@@ -8,10 +9,23 @@ export async function listBlocks(req: Request, res: Response) {
 
 export async function createManualBlock(req: Request, res: Response) {
   const { startDate, endDate, reason, roomId } = req.body;
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw ApiError.badRequest("startDate and endDate must be valid dates");
+  }
+  // Blocks are half-open [startDate, endDate) — endDate is the first free
+  // day, like a check-out date. start == end blocks nothing at all (a real
+  // client report: "start 15th, end 15th" to block the 15th).
+  if (end <= start) {
+    throw ApiError.badRequest(
+      "endDate must be after startDate — it's the first free day, so to block only the 15th send start 15th, end 16th"
+    );
+  }
   const block = await service.createManualBlock({
     propertyId: req.params.propertyId,
-    startDate: new Date(startDate),
-    endDate: new Date(endDate),
+    startDate: start,
+    endDate: end,
     reason,
     roomId,
   });

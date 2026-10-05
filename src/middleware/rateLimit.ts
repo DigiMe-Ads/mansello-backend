@@ -34,3 +34,19 @@ export const loginLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "rate_limited", message: "Too many login attempts — please try again in 15 minutes." },
 });
+
+// Public product reviews — 5 per hour per IP across all products (the
+// one-per-product-per-day rule lives in the catalog service, since it needs
+// the product id). Failed submissions (validation errors) don't count, so a
+// visitor fixing a typo in the form isn't locked out.
+export const reviewLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  skipFailedRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "rate_limited",
+    message: "You've posted several reviews recently — please try again in an hour.",
+  },
+});
