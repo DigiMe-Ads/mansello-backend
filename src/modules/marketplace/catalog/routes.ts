@@ -3,6 +3,14 @@ import multer from "multer";
 import { asyncHandler } from "@/utils/asyncHandler";
 import { requireAuth, requireRole, optionalAuth } from "@/middleware/auth";
 import { reviewLimiter } from "@/middleware/rateLimit";
+import { validate } from "@/middleware/validate";
+import {
+  createCategorySchema,
+  updateCategorySchema,
+  createProductSchema,
+  updateProductSchema,
+  stockAdjustmentSchema,
+} from "./validation";
 import * as controller from "./controller";
 
 const router = Router();
@@ -28,14 +36,19 @@ router.post("/products/:id/reviews", reviewLimiter, asyncHandler(controller.crea
 
 // Admin — marketplace_manager or super_admin.
 const manager = [requireAuth, requireRole("super_admin", "marketplace_manager")] as const;
-router.post("/categories", ...manager, asyncHandler(controller.createCategory));
-router.patch("/categories/:id", ...manager, asyncHandler(controller.updateCategory));
+router.post("/categories", ...manager, validate(createCategorySchema), asyncHandler(controller.createCategory));
+router.patch("/categories/:id", ...manager, validate(updateCategorySchema), asyncHandler(controller.updateCategory));
 router.delete("/categories/:id", ...manager, asyncHandler(controller.deleteCategory));
 router.post("/products/images", ...manager, upload.array("images", 10), asyncHandler(controller.uploadProductImages));
-router.post("/products", ...manager, asyncHandler(controller.createProduct));
-router.patch("/products/:id", ...manager, asyncHandler(controller.updateProduct));
+router.post("/products", ...manager, validate(createProductSchema), asyncHandler(controller.createProduct));
+router.patch("/products/:id", ...manager, validate(updateProductSchema), asyncHandler(controller.updateProduct));
 router.delete("/products/:id", ...manager, asyncHandler(controller.deleteProduct));
-router.post("/products/:id/stock-adjustment", ...manager, asyncHandler(controller.adjustStock));
+router.post(
+  "/products/:id/stock-adjustment",
+  ...manager,
+  validate(stockAdjustmentSchema),
+  asyncHandler(controller.adjustStock)
+);
 router.get("/low-stock", ...manager, asyncHandler(controller.listLowStock));
 router.delete("/reviews/:id", ...manager, asyncHandler(controller.deleteReview));
 

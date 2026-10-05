@@ -1,12 +1,13 @@
 import { Router } from "express";
 import { asyncHandler } from "@/utils/asyncHandler";
-import { requireAuth, requireRole, requirePropertyScope } from "@/middleware/auth";
+import { requireAuth, requireRole, requirePropertyScope, optionalAuth } from "@/middleware/auth";
 import * as controller from "./controller";
 
 const router = Router();
 
-// Public — powers the read-only booking calendar on the frontend.
-router.get("/:propertyId", asyncHandler(controller.listBlocks));
+// Public — powers the read-only booking calendar on the frontend. An admin
+// token (the Calendar & Blocks tab sends one) gets the full rows.
+router.get("/:propertyId", optionalAuth, asyncHandler(controller.listBlocks));
 
 // Admin — manual blocking (maintenance, personal use).
 router.post(

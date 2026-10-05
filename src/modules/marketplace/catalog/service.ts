@@ -16,8 +16,8 @@ const MAX_FEATURED_CATEGORIES = 4;
 export interface CategoryInput {
   name: string;
   slug?: string;
-  description?: string;
-  imageUrl?: string;
+  description?: string | null;
+  imageUrl?: string | null;
   featured?: boolean;
   parentId?: string | null;
 }
@@ -205,7 +205,7 @@ export function createProduct(input: {
   sku: string;
   initialStock: number;
   lowStockThreshold?: number;
-  weightKg?: number;
+  weightKg?: number | null;
 }) {
   return prisma.product.create({
     data: {

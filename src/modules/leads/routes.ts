@@ -4,13 +4,24 @@ import { requireAuth, requireRole } from "@/middleware/auth";
 import { validate } from "@/middleware/validate";
 import { publicFormLimiter } from "@/middleware/rateLimit";
 import * as controller from "./controller";
-import { subscribeNewsletterSchema, createCustomOrderRequestSchema } from "./validation";
+import {
+  subscribeNewsletterSchema,
+  createCustomOrderRequestSchema,
+  createContactMessageSchema,
+  createTransportRequestSchema,
+  updateLeadStatusSchema,
+} from "./validation";
 
 const router = Router();
 
 // Public — contact form + transport quote request (shared by both sites).
-router.post("/contact", publicFormLimiter, asyncHandler(controller.createContactMessage));
-router.post("/transport-requests", publicFormLimiter, asyncHandler(controller.createTransportRequest));
+router.post("/contact", publicFormLimiter, validate(createContactMessageSchema), asyncHandler(controller.createContactMessage));
+router.post(
+  "/transport-requests",
+  publicFormLimiter,
+  validate(createTransportRequestSchema),
+  asyncHandler(controller.createTransportRequest)
+);
 router.post(
   "/newsletter",
   publicFormLimiter,
@@ -27,9 +38,14 @@ router.post(
 // Admin inbox — any admin role can read leads.
 const admin = [requireAuth, requireRole("super_admin", "villa_manager", "marketplace_manager")] as const;
 router.get("/contact", ...admin, asyncHandler(controller.listContactMessages));
-router.patch("/contact/:id/status", ...admin, asyncHandler(controller.updateContactMessageStatus));
+router.patch("/contact/:id/status", ...admin, validate(updateLeadStatusSchema), asyncHandler(controller.updateContactMessageStatus));
 router.get("/transport-requests", ...admin, asyncHandler(controller.listTransportRequests));
-router.patch("/transport-requests/:id/status", ...admin, asyncHandler(controller.updateTransportRequestStatus));
+router.patch(
+  "/transport-requests/:id/status",
+  ...admin,
+  validate(updateLeadStatusSchema),
+  asyncHandler(controller.updateTransportRequestStatus)
+);
 router.get("/newsletter", ...admin, asyncHandler(controller.listNewsletterSubscribers));
 
 // Marketplace-only inbox — unlike the general leads above, custom order
@@ -40,6 +56,7 @@ router.get("/custom-orders", ...marketplaceAdmin, asyncHandler(controller.listCu
 router.patch(
   "/custom-orders/:id/status",
   ...marketplaceAdmin,
+  validate(updateLeadStatusSchema),
   asyncHandler(controller.updateCustomOrderRequestStatus)
 );
 

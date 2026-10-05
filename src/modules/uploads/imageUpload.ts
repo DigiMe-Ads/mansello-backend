@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
 
@@ -51,8 +52,10 @@ function sniffMimeType(buf: Buffer): string | null {
   return null;
 }
 
+// Validates and stores the file, returning its object key.
 async function putUploadedFile(
   file: Express.Multer.File,
+  bucket: string,
   folder: string,
   extensionByMimeType: Record<string, string>,
   allowedTypesLabel: string
@@ -77,27 +80,46 @@ async function putUploadedFile(
 
   await s3.send(
     new PutObjectCommand({
-      Bucket: env.s3.bucket,
+      Bucket: bucket,
       Key: key,
       Body: file.buffer,
       ContentType: file.mimetype,
     })
   );
 
-  return `${env.s3.publicUrl.replace(/\/$/, "")}/${key}`;
+  return key;
 }
 
 // Shared by every feature that uploads images (product catalog, offers,
 // blog, ...) — one S3/R2 client, one set of rules. `folder` just organizes
 // the bucket (products/, offers/, blog/, ...); callers don't need to agree
-// on anything else.
-export function uploadImage(file: Express.Multer.File, folder = "uploads"): Promise<string> {
-  return putUploadedFile(file, folder, IMAGE_EXTENSION_BY_MIME_TYPE, "JPEG, PNG, or WebP");
+// on anything else. Public bucket: returns a permanent public URL.
+export async function uploadImage(file: Express.Multer.File, folder = "uploads"): Promise<string> {
+  const key = await putUploadedFile(file, env.s3.bucket, folder, IMAGE_EXTENSION_BY_MIME_TYPE, "JPEG, PNG, or WebP");
+  return `${env.s3.publicUrl.replace(/\/$/, "")}/${key}`;
 }
 
-// Same bucket/client as uploadImage, own path prefix and a wider allow-list
-// (adds PDF) — used by the guest-facing booking-info form's "file" field
-// type, where a guest might be uploading a passport scan or a PDF.
-export function uploadDocument(file: Express.Multer.File, folder = "guest-documents"): Promise<string> {
-  return putUploadedFile(file, folder, DOCUMENT_EXTENSION_BY_MIME_TYPE, "JPEG, PNG, WebP, or PDF");
+export const GUEST_DOCUMENTS_PREFIX = "guest-documents/";
+const SIGNED_URL_SECONDS = 15 * 60;
+
+// Guest-submitted documents (passport scans, PDFs) for one booking-info
+// request. Stored in the PRIVATE bucket under guest-documents/<requestId>/,
+// and only the object key is returned — never a URL. Admins view them via
+// signDocumentUrl. See BACKEND_SECURITY_AUDIT.md H5.
+export function uploadDocument(file: Express.Multer.File, requestId: string): Promise<string> {
+  return putUploadedFile(
+    file,
+    env.s3.privateBucket,
+    `${GUEST_DOCUMENTS_PREFIX}${requestId}`,
+    DOCUMENT_EXTENSION_BY_MIME_TYPE,
+    "JPEG, PNG, WebP, or PDF"
+  );
+}
+
+// Short-lived link to a private document, for the admin panel (which
+// re-fetches every 10 minutes while open, so links never go stale).
+export function signDocumentUrl(key: string): Promise<string> {
+  return getSignedUrl(s3, new GetObjectCommand({ Bucket: env.s3.privateBucket, Key: key }), {
+    expiresIn: SIGNED_URL_SECONDS,
+  });
 }

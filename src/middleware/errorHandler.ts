@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from "express";
 import { ZodError } from "zod";
 import { MulterError } from "multer";
+import { Prisma } from "@prisma/client";
 import { ApiError } from "@/utils/ApiError";
 
 export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
@@ -32,6 +33,26 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
       error: "date_conflict",
       message: "These dates are no longer available for this property.",
     });
+  }
+
+  // Prisma errors that are really the caller's fault, not a server fault —
+  // an unknown id on update/delete, a duplicate unique value, a reference to
+  // a row that doesn't exist, or a malformed value (e.g. ?status=bogus).
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === "P2025") {
+      return res.status(404).json({ error: "not_found", message: "That record doesn't exist (it may have been deleted)." });
+    }
+    if (err.code === "P2002") {
+      const target = (err.meta?.target as string[] | string | undefined) ?? "value";
+      const fields = Array.isArray(target) ? target.join(", ") : target;
+      return res.status(409).json({ error: "conflict", message: `Another record already uses this ${fields}.` });
+    }
+    if (err.code === "P2003") {
+      return res.status(400).json({ error: "bad_reference", message: "This refers to a record that doesn't exist." });
+    }
+  }
+  if (err instanceof Prisma.PrismaClientValidationError) {
+    return res.status(400).json({ error: "validation_error", message: "Request contains an invalid value." });
   }
 
   console.error(err);

@@ -5,7 +5,42 @@ import { asyncHandler } from "@/utils/asyncHandler";
 import { getStripeClient, getWebhookSecret } from "./stripeClients";
 import * as bookings from "@/modules/bookings/service";
 import * as orders from "@/modules/marketplace/orders/service";
-import { sendBookingConfirmation } from "@/modules/notifications/email";
+import { sendBookingConfirmation, sendLatePaymentRefund } from "@/modules/notifications/email";
+
+// An email failure must not fail the webhook: Stripe would retry, the retry
+// would find the booking already confirmed, and the email would never be sent
+// at all (BACKEND_SECURITY_AUDIT.md M3). Logged for follow-up instead.
+async function sendConfirmationEmail(paymentIntentId: string) {
+  const booking = await bookings.getBookingByPaymentIntent(paymentIntentId);
+  if (!booking) return;
+  try {
+    await sendBookingConfirmation(
+      booking.guestEmail,
+      booking.guestName,
+      booking.property.name,
+      booking.checkIn.toISOString().slice(0, 10),
+      booking.checkOut.toISOString().slice(0, 10)
+    );
+  } catch (err) {
+    console.error(`Booking confirmation email failed for booking ${booking.id}:`, err);
+  }
+}
+
+async function sendLateRefundEmail(paymentIntentId: string) {
+  const booking = await bookings.getBookingByPaymentIntent(paymentIntentId);
+  if (!booking) return;
+  try {
+    await sendLatePaymentRefund(
+      booking.guestEmail,
+      booking.guestName,
+      booking.property.name,
+      booking.checkIn.toISOString().slice(0, 10),
+      booking.checkOut.toISOString().slice(0, 10)
+    );
+  } catch (err) {
+    console.error(`Late-payment refund email failed for booking ${booking.id}:`, err);
+  }
+}
 
 function makeWebhookRouter(accountRef: "italy" | "sri_lanka") {
   const router = Router();
@@ -38,41 +73,29 @@ function makeWebhookRouter(accountRef: "italy" | "sri_lanka") {
           // else falls back to the booking branch, which is what every
           // PaymentIntent created before that change looks like.
           if (intent.metadata?.type === "marketplace_order") {
-            const result = await orders.confirmOrderByPaymentIntent(intent.id);
-            if (result.count === 0) {
-              // Duplicate webhook delivery, or the order was cancelled
-              // (e.g. by the stale-pending cleanup job) before payment landed.
-              console.warn(
-                `[stripe:${accountRef}] payment_intent.succeeded for ${intent.id} matched no pending marketplace order (already confirmed or cancelled)`
-              );
-              break;
-            }
-            console.log(`[stripe:${accountRef}] confirmed marketplace order for PaymentIntent ${intent.id}`);
+            // Confirms a pending order, reinstates one whose payment arrived
+            // after it expired, or refunds one that can no longer be
+            // fulfilled (out of stock) — see confirmOrderByPaymentIntent.
+            const outcome = await orders.confirmOrderByPaymentIntent(intent.id);
+            console.log(`[stripe:${accountRef}] marketplace PaymentIntent ${intent.id}: ${outcome}`);
             break;
           }
 
           const result = await bookings.confirmBooking(intent.id);
           if (result.count === 0) {
-            // Either already confirmed (duplicate delivery — Stripe retries webhooks) or
-            // the pending_payment hold already expired and got cancelled before payment
-            // landed. Either way there's nothing to confirm, just log for visibility.
-            console.warn(
-              `[stripe:${accountRef}] payment_intent.succeeded for ${intent.id} matched no pending_payment booking (already confirmed or expired)`
-            );
+            // Either a duplicate delivery (already confirmed — nothing to do)
+            // or a payment that landed after the hold expired. The latter is
+            // reinstated if the dates are still free, refunded otherwise —
+            // never left as "charged with no booking" (BACKEND_SECURITY_AUDIT.md H2).
+            const outcome = await bookings.handleLateBookingPayment(intent.id);
+            console.warn(`[stripe:${accountRef}] PaymentIntent ${intent.id} matched no pending booking: ${outcome}`);
+            if (outcome === "reinstated") await sendConfirmationEmail(intent.id);
+            if (outcome === "refunded") await sendLateRefundEmail(intent.id);
             break;
           }
 
           console.log(`[stripe:${accountRef}] confirmed booking for PaymentIntent ${intent.id}`);
-          const booking = await bookings.getBookingByPaymentIntent(intent.id);
-          if (booking) {
-            await sendBookingConfirmation(
-              booking.guestEmail,
-              booking.guestName,
-              booking.property.name,
-              booking.checkIn.toISOString().slice(0, 10),
-              booking.checkOut.toISOString().slice(0, 10)
-            );
-          }
+          await sendConfirmationEmail(intent.id);
           break;
         }
         case "payment_intent.payment_failed": {

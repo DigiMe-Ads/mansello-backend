@@ -15,7 +15,7 @@ export async function updateContactMessageStatus(req: Request, res: Response) {
 
 export async function createTransportRequest(req: Request, res: Response) {
   res.status(201).json(
-    await service.createTransportRequest({ ...req.body, date: new Date(req.body.date) })
+    await service.createTransportRequest(req.body)
   );
 }
 

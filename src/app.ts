@@ -43,6 +43,13 @@ export function createApp() {
 
   app.use(helmet());
   app.use(cors({ origin: env.corsOrigin }));
+  // Two routes carry their secret in the path — our iCal export token and a
+  // guest's booking-info link. Mask both before they reach Railway's logs.
+  morgan.token("url", (req: express.Request) =>
+    (req.originalUrl || req.url || "")
+      .replace(/^\/ical\/[^/?]+\.ics/, "/ical/***.ics")
+      .replace(/^\/api\/booking-info-requests\/[^/?]+/, "/api/booking-info-requests/***")
+  );
   app.use(morgan(env.nodeEnv === "development" ? "dev" : "combined"));
 
   // Stripe webhooks need the raw body for signature verification, so they're

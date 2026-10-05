@@ -1,6 +1,11 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { ApiError } from "@/utils/ApiError";
 import { computeShippingFee } from "@/modules/marketplace/shipping/service";
+import { cancelPaymentIntentQuietly, refundPaymentIntent } from "@/modules/payments/service";
+
+// The marketplace rides on the Sri Lanka Stripe account — see orders/controller.ts.
+const MARKETPLACE_STRIPE_ACCOUNT = "sri_lanka" as const;
 
 const COD_ABUSE_THRESHOLD = 3; // cancelled/returned orders before flagging
 
@@ -21,9 +26,18 @@ export async function createOrder(input: {
 }) {
   const products = await prisma.product.findMany({
     where: { id: { in: input.items.map((i) => i.productId) }, active: true },
+    include: { stockLevel: true },
   });
   if (products.length !== input.items.length) {
     throw ApiError.badRequest("One or more products are unavailable");
+  }
+
+  // Early, friendly check so the customer fixes their cart before paying.
+  // Not a reservation — stock is only taken at confirmation, which re-checks
+  // atomically (see takeStock).
+  for (const item of input.items) {
+    const product = products.find((p) => p.id === item.productId)!;
+    assertInStock(product.name, product.stockLevel?.quantityOnHand ?? 0, item.quantity);
   }
 
   const lineItems = input.items.map((item) => {
@@ -101,6 +115,31 @@ export function getOrder(id: string) {
   return prisma.order.findUnique({ where: { id }, include: { items: true } });
 }
 
+function assertInStock(name: string, onHand: number, wanted: number) {
+  if (wanted <= onHand) return;
+  throw ApiError.conflict(
+    onHand <= 0
+      ? `${name} is out of stock — please remove it from your cart.`
+      : `Only ${onHand} × ${name} left — please update your cart.`
+  );
+}
+
+// Decrements each line's stock only if enough is on hand (a conditional
+// update, so two concurrent confirmations can't both take the last unit).
+// Throws a 409 naming the product otherwise, rolling back the transaction.
+async function takeStock(tx: Prisma.TransactionClient, items: { productId: string; quantity: number; productNameSnapshot: string }[]) {
+  for (const item of items) {
+    const taken = await tx.stockLevel.updateMany({
+      where: { productId: item.productId, quantityOnHand: { gte: item.quantity } },
+      data: { quantityOnHand: { decrement: item.quantity } },
+    });
+    if (taken.count === 0) {
+      const level = await tx.stockLevel.findUnique({ where: { productId: item.productId } });
+      assertInStock(item.productNameSnapshot, level?.quantityOnHand ?? 0, item.quantity);
+    }
+  }
+}
+
 // This is the point stock actually leaves inventory. Before
 // BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md it only ran when an admin phoned/
 // verified a COD order; now it's normally driven by confirmOrderByPaymentIntent
@@ -112,12 +151,7 @@ export async function confirmOrder(orderId: string) {
   if (order.status !== "pending") throw ApiError.badRequest("Only pending orders can be confirmed");
 
   return prisma.$transaction(async (tx) => {
-    for (const item of order.items) {
-      await tx.stockLevel.update({
-        where: { productId: item.productId },
-        data: { quantityOnHand: { decrement: item.quantity } },
-      });
-    }
+    await takeStock(tx, order.items);
     return tx.order.update({ where: { id: orderId }, data: { status: "confirmed" } });
   });
 }
@@ -131,13 +165,56 @@ export async function confirmOrder(orderId: string) {
 // (already confirmed, or the order was cancelled first) — same shape as
 // confirmBooking's updateMany result, for the same reason: nothing to do,
 // not an error.
-export async function confirmOrderByPaymentIntent(stripePaymentIntentId: string) {
+//
+// A paid order that can't be fulfilled — stock ran out between checkout and
+// payment, or the order was cancelled (expired) before a late payment landed
+// — is refunded in full automatically rather than backordered
+// (BACKEND_CHANGES_SECURITY_AUDIT_FRONTEND.md C3/H2). An order that was
+// cancelled but CAN still be fulfilled is reinstated instead.
+export async function confirmOrderByPaymentIntent(
+  stripePaymentIntentId: string
+): Promise<"confirmed" | "refunded" | "refund_failed" | "nothing_to_do"> {
   const order = await prisma.order.findFirst({
-    where: { stripePaymentIntentId, status: "pending" },
+    where: { stripePaymentIntentId },
+    include: { items: true },
   });
-  if (!order) return { count: 0 };
-  await confirmOrder(order.id);
-  return { count: 1 };
+  if (!order) return "nothing_to_do";
+  const late = order.status === "cancelled" && !order.stripeRefundId;
+  if (order.status !== "pending" && !late) return "nothing_to_do"; // duplicate delivery
+
+  try {
+    const done = await prisma.$transaction(async (tx) => {
+      const flipped = await tx.order.updateMany({
+        where: { id: order.id, status: order.status },
+        data: { status: "confirmed" },
+      });
+      if (flipped.count === 0) return false; // a concurrent delivery got here first
+      await takeStock(tx, order.items);
+      return true;
+    });
+    return done ? "confirmed" : "nothing_to_do";
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    console.warn(`Paid order ${order.id} can't be fulfilled (${err.message}) — refunding`);
+  }
+
+  await prisma.order.updateMany({ where: { id: order.id, status: "pending" }, data: { status: "cancelled" } });
+  const outcome = await refundOrder(order.id, stripePaymentIntentId, Number(order.total), `unfulfillable-order-${order.id}`);
+  return outcome;
+}
+
+// Records the Stripe refund's outcome on the order rather than throwing —
+// the status change that triggered it has already happened.
+async function refundOrder(orderId: string, paymentIntentId: string, amount: number, idempotencyKey: string) {
+  try {
+    const refund = await refundPaymentIntent(MARKETPLACE_STRIPE_ACCOUNT, paymentIntentId, amount, idempotencyKey);
+    await prisma.order.update({ where: { id: orderId }, data: { stripeRefundId: refund?.id ?? null, refundError: null } });
+    return "refunded" as const;
+  } catch (err) {
+    console.error(`Refund failed for order ${orderId} (PaymentIntent ${paymentIntentId}):`, err);
+    await prisma.order.update({ where: { id: orderId }, data: { refundError: (err as Error).message } });
+    return "refund_failed" as const;
+  }
 }
 
 const VALID_TRANSITIONS: Record<string, string[]> = {
@@ -162,7 +239,12 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
   const shouldRestock =
     ["cancelled", "returned"].includes(nextStatus) && order.status !== "pending";
 
-  return prisma.$transaction(async (tx) => {
+  const updated = await prisma.$transaction(async (tx) => {
+    const flipped = await tx.order.updateMany({
+      where: { id: orderId, status: order.status },
+      data: { status: nextStatus as never },
+    });
+    if (flipped.count === 0) throw ApiError.conflict("This order was changed by someone else — reload and try again");
     if (shouldRestock) {
       for (const item of order.items) {
         await tx.stockLevel.update({
@@ -171,8 +253,23 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
         });
       }
     }
-    return tx.order.update({ where: { id: orderId }, data: { status: nextStatus as never } });
+    return tx.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true } });
   });
+
+  // Money side, after the status change has committed:
+  // - a never-paid (pending) order being cancelled → make its PaymentIntent
+  //   unpayable so the customer can't still pay for it;
+  // - a paid order being cancelled/returned → full refund, outcome recorded
+  //   on the order (refunded once only — idempotency key per order).
+  if (order.stripePaymentIntentId && ["cancelled", "returned"].includes(nextStatus)) {
+    if (order.status === "pending") {
+      await cancelPaymentIntentQuietly(MARKETPLACE_STRIPE_ACCOUNT, order.stripePaymentIntentId);
+    } else {
+      await refundOrder(orderId, order.stripePaymentIntentId, Number(order.total), `refund-order-${orderId}`);
+      return prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true } });
+    }
+  }
+  return updated;
 }
 
 // Cancels orders left "pending" (payment never completed — abandoned
@@ -192,11 +289,24 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
 // this job was ever wired into cron — see the closing summary for
 // BACKEND_CHANGES_MARKETPLACE_PAYMENTS.md/TESTIMONIALS.md for the incident
 // and how it was reverted.
+//
+// Also cancels each order's PaymentIntent so it can't be paid after the fact
+// (BACKEND_SECURITY_AUDIT.md H2); a payment that races in anyway is handled
+// by confirmOrderByPaymentIntent's late-payment path.
 export async function expireStalePendingOrders(olderThanHours = 24) {
   const cutoff = new Date(Date.now() - olderThanHours * 60 * 60 * 1000);
+  const where = { status: "pending" as const, paymentMethod: "card", createdAt: { lt: cutoff } };
+  const stale = await prisma.order.findMany({ where, select: { id: true, stripePaymentIntentId: true } });
+  if (stale.length === 0) return 0;
+
   const result = await prisma.order.updateMany({
-    where: { status: "pending", paymentMethod: "card", createdAt: { lt: cutoff } },
+    where: { ...where, id: { in: stale.map((o) => o.id) } },
     data: { status: "cancelled" },
   });
+  for (const order of stale) {
+    if (order.stripePaymentIntentId) {
+      await cancelPaymentIntentQuietly(MARKETPLACE_STRIPE_ACCOUNT, order.stripePaymentIntentId);
+    }
+  }
   return result.count;
 }

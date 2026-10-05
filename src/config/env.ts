@@ -64,7 +64,15 @@ export const env = {
     accessKeyId: process.env.S3_ACCESS_KEY_ID ?? "",
     secretAccessKey: process.env.S3_SECRET_ACCESS_KEY ?? "",
     publicUrl: process.env.S3_PUBLIC_URL ?? "",
+    // Guest-submitted documents (passport scans) — same endpoint/credentials,
+    // but a PRIVATE bucket served only via short-lived signed URLs. Must not
+    // be the public image bucket above.
+    privateBucket: process.env.S3_PRIVATE_BUCKET ?? "mansello-private",
   },
+
+  // Set to "true" for local development so `npm run dev` doesn't run the iCal
+  // sync / expiry / email cron jobs against whatever database .env points at.
+  disableJobs: process.env.DISABLE_JOBS === "true",
 
   airbnbSyncCron: process.env.AIRBNB_SYNC_CRON ?? "*/30 * * * *",
   bookingHoldMinutes: Number(process.env.BOOKING_HOLD_MINUTES ?? 15),

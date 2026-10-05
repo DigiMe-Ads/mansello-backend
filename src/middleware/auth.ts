@@ -24,13 +24,16 @@ declare global {
   }
 }
 
+// Pinned so a token can never pick its own verification algorithm.
+export const JWT_VERIFY_OPTIONS: jwt.VerifyOptions = { algorithms: ["HS256"] };
+
 export function requireAuth(req: Request, _res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) throw ApiError.unauthorized();
 
   const token = header.slice("Bearer ".length);
   try {
-    req.admin = jwt.verify(token, env.jwtAccessSecret) as AdminJwtPayload;
+    req.admin = jwt.verify(token, env.jwtAccessSecret, JWT_VERIFY_OPTIONS) as AdminJwtPayload;
     next();
   } catch {
     throw ApiError.unauthorized("Invalid or expired token");
@@ -49,7 +52,7 @@ export function optionalAuth(req: Request, _res: Response, next: NextFunction) {
 
   const token = header.slice("Bearer ".length);
   try {
-    req.admin = jwt.verify(token, env.jwtAccessSecret) as AdminJwtPayload;
+    req.admin = jwt.verify(token, env.jwtAccessSecret, JWT_VERIFY_OPTIONS) as AdminJwtPayload;
   } catch {
     // fall through as anonymous
   }
@@ -73,4 +76,17 @@ export function requirePropertyScope(propertyIdParam = "propertyId") {
     if (req.admin.role === "villa_manager" && req.admin.propertyScopeId === propertyId) return next();
     throw ApiError.forbidden("Not scoped to this property");
   };
+}
+
+// For handlers that only learn the propertyId after loading a row (a block,
+// a booking, …) — the same rule requirePropertyScope applies to route params.
+export function canAccessProperty(admin: AdminJwtPayload | undefined, propertyId: string): boolean {
+  if (!admin) return false;
+  if (admin.role === "super_admin") return true;
+  return admin.role === "villa_manager" && admin.propertyScopeId === propertyId;
+}
+
+export function assertPropertyScope(req: Request, propertyId: string) {
+  if (!req.admin) throw ApiError.unauthorized();
+  if (!canAccessProperty(req.admin, propertyId)) throw ApiError.forbidden("Not scoped to this property");
 }

@@ -3,6 +3,7 @@ import { prisma } from "@/db/prisma";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
 import { sendGuestInfoRequest } from "@/modules/notifications/email";
+import { GUEST_DOCUMENTS_PREFIX, signDocumentUrl } from "@/modules/uploads/imageUpload";
 
 const TEMPLATE_ID = "default";
 const EXPIRY_MS = 14 * 24 * 60 * 60 * 1000;
@@ -89,12 +90,32 @@ export async function createBookingInfoRequest(booking: {
   return toAdminShape(row);
 }
 
+// File answers are stored as private-bucket keys; the admin gets each one
+// swapped for a 15-minute signed URL, everything else unchanged. (A legacy
+// answer that's already a full URL is passed through as-is.)
+async function withSignedDocumentUrls(answers: Prisma.JsonValue | null) {
+  if (!answers || typeof answers !== "object" || Array.isArray(answers)) return answers;
+  const signed: Record<string, unknown> = {};
+  for (const [fieldId, value] of Object.entries(answers)) {
+    signed[fieldId] = Array.isArray(value)
+      ? await Promise.all(
+          value.map((v) =>
+            typeof v === "string" && v.startsWith(GUEST_DOCUMENTS_PREFIX) ? signDocumentUrl(v) : v
+          )
+        )
+      : value;
+  }
+  return signed;
+}
+
 export async function listBookingInfoRequests(bookingId: string) {
   const rows = await prisma.bookingInfoRequest.findMany({
     where: { bookingId },
     orderBy: { createdAt: "desc" },
   });
-  return rows.map(toAdminShape);
+  return Promise.all(
+    rows.map(async (row) => ({ ...toAdminShape(row), answers: await withSignedDocumentUrls(row.answers) }))
+  );
 }
 
 // -- Public, token-gated ------------------------------------------------------
@@ -144,14 +165,51 @@ async function getActionableRequest(token: string) {
 // includes the resulting URL(s) in the eventual submit payload, same as any
 // other field. This just gates the upload behind the same token/status
 // rules as submit, so a dead link can't be used to fill a bucket either.
-export async function assertUploadable(token: string): Promise<void> {
-  await getActionableRequest(token);
+export function assertUploadable(token: string) {
+  return getActionableRequest(token);
+}
+
+const MAX_TEXT_ANSWER = 5000;
+const ISSUED_KEY_SUFFIX = /^[0-9a-f-]{36}\.(jpg|png|webp|pdf)$/;
+
+// Answers must match the form they were sent for (BACKEND_SECURITY_AUDIT.md
+// M2): only known field ids, the right value type per field, and every file
+// answer must be a document key this backend issued for THIS request — so a
+// guest can't plant an arbitrary link for the admin to click.
+function assertAnswersMatchFields(requestId: string, fields: GuestInfoField[], answers: GuestInfoAnswers) {
+  const byId = new Map(fields.map((f) => [f.id, f]));
+  const prefix = `${GUEST_DOCUMENTS_PREFIX}${requestId}/`;
+  const isIssuedKey = (v: unknown) =>
+    typeof v === "string" && v.startsWith(prefix) && ISSUED_KEY_SUFFIX.test(v.slice(prefix.length));
+
+  for (const [fieldId, value] of Object.entries(answers)) {
+    const field = byId.get(fieldId);
+    if (!field) throw ApiError.badRequest("The form has changed — please reload the page and try again");
+    const label = `"${field.label}"`;
+
+    if (field.type === "file") {
+      if (!Array.isArray(value) || !value.every(isIssuedKey)) {
+        throw ApiError.badRequest(`Please re-upload the file(s) for ${label}`);
+      }
+    } else if (field.type === "checkbox") {
+      if (typeof value !== "boolean") throw ApiError.badRequest(`${label} must be ticked or unticked`);
+    } else {
+      if (typeof value !== "string") throw ApiError.badRequest(`${label} must be text`);
+      if (value.length > MAX_TEXT_ANSWER) {
+        throw ApiError.badRequest(`${label} is too long (max ${MAX_TEXT_ANSWER} characters)`);
+      }
+      if (field.type === "select" && field.options?.length && value && !field.options.includes(value)) {
+        throw ApiError.badRequest(`Please choose one of the options for ${label}`);
+      }
+    }
+  }
 }
 
 export async function submitBookingInfoRequest(token: string, answers: GuestInfoAnswers) {
   const row = await getActionableRequest(token);
 
   const fields = row.fields as unknown as GuestInfoField[];
+  assertAnswersMatchFields(row.id, fields, answers);
   const missing = fields.filter((field) => field.required && !isAnswered(answers[field.id]));
   if (missing.length > 0) {
     throw ApiError.badRequest(

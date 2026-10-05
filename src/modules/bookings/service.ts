@@ -2,6 +2,8 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
+import { cancelPaymentIntentQuietly, refundPaymentIntent } from "@/modules/payments/service";
+import { StripeAccountRef } from "@/modules/payments/stripeClients";
 
 function isExclusionViolation(err: unknown): boolean {
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
@@ -382,7 +384,48 @@ async function createBookingAvailabilityBlocks(
   }
 }
 
+// Guest-facing limits (BACKEND_SECURITY_AUDIT.md H4), applied to the public
+// checkout only — an admin's offline booking may legitimately record a past
+// stay or a long let. Keep MAX_STAY_NIGHTS in sync with the frontend's
+// MAX_STAY_NIGHTS (src/lib/availability.ts).
+export const MAX_STAY_NIGHTS = 60;
+export const MAX_ADVANCE_MONTHS = 18;
+
+// "Today" as a YYYY-MM-DD calendar date in the property's own timezone.
+function todayIn(timezone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+async function assertPublicBookingWindow(propertyId: string, checkIn: Date, checkOut: Date) {
+  const property = await prisma.property.findUnique({ where: { id: propertyId } });
+  if (!property) throw ApiError.notFound("Property not found");
+
+  const nights = Math.round((checkOut.getTime() - checkIn.getTime()) / MS_PER_DAY);
+  if (nights > MAX_STAY_NIGHTS) {
+    throw ApiError.badRequest(
+      `Maximum stay is ${MAX_STAY_NIGHTS} nights — please contact us for longer stays`
+    );
+  }
+
+  const today = todayIn(property.timezone);
+  if (checkIn.toISOString().slice(0, 10) < today) {
+    throw ApiError.badRequest("Check-in can't be in the past");
+  }
+
+  const [y, m, d] = today.split("-").map(Number);
+  const horizon = new Date(Date.UTC(y, m - 1 + MAX_ADVANCE_MONTHS, d));
+  if (checkIn > horizon) {
+    throw ApiError.badRequest(`Bookings open up to ${MAX_ADVANCE_MONTHS} months ahead`);
+  }
+}
+
 export async function createPendingBooking(input: CreatePendingBookingInput) {
+  await assertPublicBookingWindow(input.propertyId, input.checkIn, input.checkOut);
   const priced = await computeBookingPrice(
     input.propertyId,
     input.checkIn,
@@ -576,9 +619,15 @@ export function listBookingsForProperty(propertyId: string, status?: string) {
 
 // Cancels an expired pending_payment hold and frees the dates. Called by the
 // booking-expiry job (src/jobs/bookingExpiry.ts) on a schedule.
+//
+// Also cancels each hold's PaymentIntent, so a guest who comes back after the
+// hold expired can't be charged for dates that may already be resold
+// (BACKEND_SECURITY_AUDIT.md H2). If the payment raced in first, the cancel
+// fails harmlessly and the webhook's late-payment backstop takes over.
 export async function expireStalePendingBookings() {
   const stale = await prisma.booking.findMany({
     where: { status: "pending_payment", expiresAt: { lt: new Date() } },
+    include: { property: { select: { stripeAccountRef: true } } },
   });
 
   for (const booking of stale) {
@@ -586,9 +635,81 @@ export async function expireStalePendingBookings() {
       prisma.booking.update({ where: { id: booking.id }, data: { status: "cancelled", cancelledAt: new Date() } }),
       prisma.availabilityBlock.updateMany({ where: { bookingId: booking.id }, data: { status: "cancelled" } }),
     ]);
+    if (booking.stripePaymentIntentId) {
+      await cancelPaymentIntentQuietly(
+        booking.property.stripeAccountRef as StripeAccountRef,
+        booking.stripePaymentIntentId
+      );
+    }
   }
 
   return stale.length;
+}
+
+// Webhook backstop (H2): a payment succeeded for a booking that is no longer
+// pending — normally its hold expired first. If its dates are still free,
+// reinstate it as confirmed; otherwise refund the full amount. Returns what
+// happened so the webhook can email the guest accordingly.
+export async function handleLateBookingPayment(
+  stripePaymentIntentId: string
+): Promise<"reinstated" | "refunded" | "refund_failed" | "nothing_to_do"> {
+  const booking = await prisma.booking.findFirst({
+    where: { stripePaymentIntentId },
+    include: { property: true },
+  });
+  if (!booking || booking.status !== "cancelled" || booking.stripeRefundId) return "nothing_to_do";
+
+  const rooms = booking.roomIds.map((id) => ({ id }));
+  try {
+    const reinstated = await prisma.$transaction(async (tx) => {
+      const flipped = await tx.booking.updateMany({
+        where: { id: booking.id, status: "cancelled" },
+        data: { status: "confirmed", cancelledAt: null, expiresAt: null },
+      });
+      // A concurrent delivery of the same webhook already handled it.
+      if (flipped.count === 0) return false;
+      await createBookingAvailabilityBlocks(
+        tx,
+        booking.propertyId,
+        booking.id,
+        booking.checkIn,
+        booking.checkOut,
+        rooms
+      );
+      return true;
+    });
+    return reinstated ? "reinstated" : "nothing_to_do";
+  } catch (err) {
+    if (!(err instanceof ApiError) && !isExclusionViolation(err)) throw err;
+  }
+
+  // Dates taken in the meantime — give the money back.
+  const amount = Number(booking.totalPrice);
+  try {
+    const refund = await refundPaymentIntent(
+      booking.property.stripeAccountRef as StripeAccountRef,
+      stripePaymentIntentId,
+      amount,
+      `late-payment-refund-booking-${booking.id}`
+    );
+    await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        refundAmount: amount,
+        refundReason: "Payment arrived after the hold expired and the dates were no longer available",
+        stripeRefundId: refund?.id ?? null,
+        refundError: null,
+      },
+    });
+    return "refunded";
+  } catch (err) {
+    await prisma.booking.update({
+      where: { id: booking.id },
+      data: { refundError: (err as Error).message },
+    });
+    console.error(`Late-payment refund failed for booking ${booking.id}:`, err);
+    return "refund_failed";
+  }
 }
 
 // Default policy from BACKEND_PLAN.md §9, overridable per property later.
@@ -606,24 +727,62 @@ export function computeRefundAmount(totalPrice: number, checkIn: Date, now = new
   return 0;
 }
 
-export async function cancelBooking(bookingId: string, refundOverride?: number, reason?: string) {
-  const booking = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
-  const refundAmount =
-    refundOverride ?? computeRefundAmount(Number(booking.totalPrice), booking.checkIn);
+const CANCELLABLE_STATUSES = ["pending_payment", "confirmed", "paid_offline"] as const;
 
-  // Capture the update's own result rather than returning the pre-fetch
-  // above — that row is stale the moment the transaction commits (still
-  // shows the pre-cancellation status/cancelledAt), which used to be what
-  // this function handed back to the API caller.
-  const [updatedBooking] = await prisma.$transaction([
-    prisma.booking.update({
-      where: { id: bookingId },
+// Admin cancellation (BACKEND_SECURITY_AUDIT.md H3):
+// - Only a live booking can be cancelled — never twice (which used to refund
+//   twice), never a completed stay.
+// - A pending_payment hold was never paid: nothing is refunded, its
+//   PaymentIntent is cancelled instead.
+// - The refund can't exceed what was paid. paid_offline has no Stripe
+//   payment, so its refundAmount is recorded for the admin to pay back by hand.
+// - The status flip is conditional (updateMany on the old status), so two
+//   concurrent cancels can't both proceed to the refund.
+// - The Stripe refund runs after the DB commit and its outcome is stored
+//   (stripeRefundId, or refundError if it failed) instead of failing the
+//   whole request after the booking is already cancelled.
+export async function cancelBooking(bookingId: string, refundOverride?: number, reason?: string) {
+  const booking = await prisma.booking.findUnique({ where: { id: bookingId }, include: { property: true } });
+  if (!booking) throw ApiError.notFound("Booking not found");
+  if (!(CANCELLABLE_STATUSES as readonly string[]).includes(booking.status)) {
+    throw ApiError.badRequest(`This booking is already ${booking.status.replace("_", " ")} and can't be cancelled`);
+  }
+
+  const paid = booking.status === "pending_payment" ? 0 : Number(booking.totalPrice);
+  if (refundOverride !== undefined && refundOverride > paid) {
+    throw ApiError.badRequest(`The refund can't be more than the ${paid.toFixed(2)} ${booking.currency.toUpperCase()} paid`);
+  }
+  const refundAmount =
+    booking.status === "pending_payment"
+      ? 0
+      : refundOverride ?? computeRefundAmount(paid, booking.checkIn);
+
+  const [flipped] = await prisma.$transaction([
+    prisma.booking.updateMany({
+      where: { id: bookingId, status: booking.status },
       data: { status: "cancelled", cancelledAt: new Date(), refundAmount, refundReason: reason },
     }),
     prisma.availabilityBlock.updateMany({ where: { bookingId }, data: { status: "cancelled" } }),
   ]);
+  if (flipped.count === 0) throw ApiError.conflict("This booking was changed by someone else — reload and try again");
 
-  // Actual Stripe refund call happens in modules/payments — triggered from the controller
-  // so this service function stays payment-provider agnostic.
-  return { booking: updatedBooking, refundAmount };
+  const accountRef = booking.property.stripeAccountRef as StripeAccountRef;
+  if (booking.status === "pending_payment" && booking.stripePaymentIntentId) {
+    await cancelPaymentIntentQuietly(accountRef, booking.stripePaymentIntentId);
+  } else if (booking.status === "confirmed" && booking.stripePaymentIntentId && refundAmount > 0) {
+    try {
+      const refund = await refundPaymentIntent(
+        accountRef,
+        booking.stripePaymentIntentId,
+        refundAmount,
+        `refund-booking-${bookingId}`
+      );
+      await prisma.booking.update({ where: { id: bookingId }, data: { stripeRefundId: refund?.id ?? null } });
+    } catch (err) {
+      console.error(`Refund failed for booking ${bookingId}:`, err);
+      await prisma.booking.update({ where: { id: bookingId }, data: { refundError: (err as Error).message } });
+    }
+  }
+
+  return prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
 }

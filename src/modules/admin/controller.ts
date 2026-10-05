@@ -36,8 +36,8 @@ export async function deleteAdminUser(req: Request, res: Response) {
   res.status(204).send();
 }
 
-export async function getDashboard(_req: Request, res: Response) {
-  res.json(await service.getDashboard());
+export async function getDashboard(req: Request, res: Response) {
+  res.json(await service.getDashboard(req.admin!));
 }
 
 export async function me(req: Request, res: Response) {

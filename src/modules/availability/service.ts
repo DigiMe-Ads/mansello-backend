@@ -64,6 +64,10 @@ export async function createManualBlock(input: {
   });
 }
 
+export function getBlock(id: string) {
+  return prisma.availabilityBlock.findUnique({ where: { id } });
+}
+
 export function releaseBlock(blockId: string) {
   return prisma.availabilityBlock.update({ where: { id: blockId }, data: { status: "cancelled" } });
 }

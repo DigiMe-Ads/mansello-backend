@@ -26,3 +26,17 @@ export const updatePropertySchema = z.object({
     maxGuests: z.coerce.number().int().min(1).optional(),
   }),
 });
+
+export const updatePricingTiersSchema = z.object({
+  body: z.object({
+    tiers: z
+      .array(
+        z.object({
+          guestCount: z.coerce.number().int().min(1),
+          rooms: z.coerce.number().int().min(1).optional(),
+          pricePerNight: z.coerce.number().min(0),
+        })
+      )
+      .max(100),
+  }),
+});

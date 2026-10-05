@@ -7,6 +7,11 @@ import { runClickEventRetentionJob } from "./clickEventRetention";
 import { runOrderExpiryJob } from "./orderExpiry";
 
 export function startJobs() {
+  if (env.disableJobs) {
+    console.log("Scheduled jobs disabled (DISABLE_JOBS=true)");
+    return;
+  }
+
   // Airbnb typically refreshes imported calendars roughly hourly on their
   // side; polling every 30 min on ours keeps the residual sync-lag window
   // as small as practical (BACKEND_PLAN.md §4).

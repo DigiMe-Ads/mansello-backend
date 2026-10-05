@@ -5,7 +5,7 @@ export function createContactMessage(input: {
   site: "italy" | "sri_lanka";
   name: string;
   email: string;
-  subject: "room_booking" | "airport_transfer" | "marketplace" | "other";
+  subject: "room_booking" | "airport_transfer" | "tour_package" | "marketplace" | "other";
   message: string;
 }) {
   return prisma.contactMessage.create({ data: input });
@@ -22,7 +22,22 @@ export function updateContactMessageStatus(id: string, status: "new" | "read" | 
   return prisma.contactMessage.update({ where: { id }, data: { status } });
 }
 
-export function createTransportRequest(input: {
+// A transfer add-on links to the booking created seconds earlier by the same
+// checkout. Since the endpoint is public, the link is only accepted when it
+// genuinely is that booking: it exists, belongs to the given property, is
+// still live, and was made with the same email.
+async function assertLinkableBooking(input: { bookingId?: string; propertyId?: string; contactEmail: string }) {
+  if (!input.bookingId) return;
+  const booking = await prisma.booking.findUnique({ where: { id: input.bookingId } });
+  const valid =
+    booking &&
+    (!input.propertyId || booking.propertyId === input.propertyId) &&
+    (booking.status === "pending_payment" || booking.status === "confirmed") &&
+    booking.guestEmail.trim().toLowerCase() === input.contactEmail.trim().toLowerCase();
+  if (!valid) throw ApiError.badRequest("This transfer request doesn't match a current booking");
+}
+
+export async function createTransportRequest(input: {
   propertyId?: string;
   bookingId?: string;
   type: "fixed_price" | "custom_quote";
@@ -34,6 +49,7 @@ export function createTransportRequest(input: {
   contactPhone: string;
   notes?: string;
 }) {
+  await assertLinkableBooking(input);
   return prisma.transportRequest.create({ data: input });
 }
 

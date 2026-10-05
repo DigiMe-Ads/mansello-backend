@@ -1,9 +1,10 @@
 import bcrypt from "bcryptjs";
+import { Prisma } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import { prisma } from "@/db/prisma";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
-import { AdminJwtPayload } from "@/middleware/auth";
+import { AdminJwtPayload, JWT_VERIFY_OPTIONS } from "@/middleware/auth";
 
 function signTokens(payload: AdminJwtPayload) {
   const accessToken = jwt.sign(payload, env.jwtAccessSecret, {
@@ -15,12 +16,19 @@ function signTokens(payload: AdminJwtPayload) {
   return { accessToken, refreshToken };
 }
 
-export async function login(email: string, password: string) {
-  const admin = await prisma.adminUser.findUnique({ where: { email } });
-  if (!admin) throw ApiError.unauthorized("Invalid email or password");
+// Compared against when the email doesn't exist, so an unknown email takes
+// as long as a wrong password — response timing no longer reveals which
+// admin emails are real (BACKEND_SECURITY_AUDIT.md L2).
+const DUMMY_HASH = bcrypt.hashSync("not-a-real-password", 12);
 
-  const valid = await bcrypt.compare(password, admin.passwordHash);
-  if (!valid) throw ApiError.unauthorized("Invalid email or password");
+export async function login(email: string, password: string) {
+  const admin =
+    typeof email === "string" ? await prisma.adminUser.findUnique({ where: { email } }) : null;
+  const valid = await bcrypt.compare(
+    typeof password === "string" ? password : "",
+    admin?.passwordHash ?? DUMMY_HASH
+  );
+  if (!admin || !valid) throw ApiError.unauthorized("Invalid email or password");
 
   const payload: AdminJwtPayload = {
     sub: admin.id,
@@ -37,7 +45,7 @@ export async function login(email: string, password: string) {
 export async function refresh(refreshToken: string) {
   let payload: AdminJwtPayload;
   try {
-    payload = jwt.verify(refreshToken, env.jwtRefreshSecret) as AdminJwtPayload;
+    payload = jwt.verify(refreshToken, env.jwtRefreshSecret, JWT_VERIFY_OPTIONS) as AdminJwtPayload;
   } catch {
     throw ApiError.unauthorized("Invalid or expired refresh token");
   }
@@ -65,25 +73,35 @@ export async function logout(adminId: string) {
   await prisma.adminUser.update({ where: { id: adminId }, data: { tokenVersion: { increment: 1 } } });
 }
 
-export async function getDashboard() {
+// Scoped to what the caller may see (BACKEND_SECURITY_AUDIT.md M1): a villa
+// manager sees only their own property's guests and revenue, a marketplace
+// manager sees no booking data at all. Same response shape for everyone.
+export async function getDashboard(admin: AdminJwtPayload) {
   const now = new Date();
   const in7Days = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const bookingScope: Prisma.BookingWhereInput =
+    admin.role === "super_admin"
+      ? {}
+      : admin.role === "villa_manager" && admin.propertyScopeId
+        ? { propertyId: admin.propertyScopeId }
+        : { id: { in: [] } };
+  const seesMarketplace = admin.role === "super_admin" || admin.role === "marketplace_manager";
 
   const [upcomingCheckIns, upcomingCheckOuts, revenueByProperty, lowStockCount, pendingOrders] =
     await Promise.all([
       prisma.booking.findMany({
-        where: { checkIn: { gte: now, lte: in7Days }, status: { in: ["confirmed", "paid_offline"] } },
+        where: { ...bookingScope, checkIn: { gte: now, lte: in7Days }, status: { in: ["confirmed", "paid_offline"] } },
         include: { property: true },
         orderBy: { checkIn: "asc" },
       }),
       prisma.booking.findMany({
-        where: { checkOut: { gte: now, lte: in7Days }, status: { in: ["confirmed", "paid_offline"] } },
+        where: { ...bookingScope, checkOut: { gte: now, lte: in7Days }, status: { in: ["confirmed", "paid_offline"] } },
         include: { property: true },
         orderBy: { checkOut: "asc" },
       }),
       prisma.booking.groupBy({
         by: ["propertyId"],
-        where: { status: { in: ["confirmed", "paid_offline", "completed"] } },
+        where: { ...bookingScope, status: { in: ["confirmed", "paid_offline", "completed"] } },
         _sum: { totalPrice: true },
       }),
       prisma.$queryRaw<{ count: bigint }[]>`
@@ -96,8 +114,8 @@ export async function getDashboard() {
     upcomingCheckIns,
     upcomingCheckOuts,
     revenueByProperty,
-    lowStockCount: Number(lowStockCount[0]?.count ?? 0),
-    pendingOrdersCount: pendingOrders,
+    lowStockCount: seesMarketplace ? Number(lowStockCount[0]?.count ?? 0) : 0,
+    pendingOrdersCount: seesMarketplace ? pendingOrders : 0,
   };
 }
 
@@ -106,7 +124,7 @@ export async function createAdminUser(input: {
   email: string;
   password: string;
   role: "super_admin" | "villa_manager" | "marketplace_manager";
-  propertyScopeId?: string;
+  propertyScopeId?: string | null;
 }) {
   const passwordHash = await bcrypt.hash(input.password, 12);
   return prisma.adminUser.create({

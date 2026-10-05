@@ -52,11 +52,14 @@ export async function submitByToken(req: Request, res: Response) {
 // submit, checked before touching S3 so a dead link can't be used to fill
 // a bucket.
 export async function uploadFiles(req: Request, res: Response) {
-  await service.assertUploadable(req.params.token);
+  const request = await service.assertUploadable(req.params.token);
 
   const files = req.files as Express.Multer.File[] | undefined;
   if (!files?.length) throw ApiError.badRequest('No files uploaded (field name must be "files")');
 
-  const urls = await Promise.all(files.map((file) => uploadDocument(file)));
+  // Opaque object keys in the private bucket, not viewable URLs — the field
+  // keeps its old name so the frontend contract doesn't change. The guest
+  // sends them back unchanged in answers[fieldId] on submit.
+  const urls = await Promise.all(files.map((file) => uploadDocument(file, request.id)));
   res.status(201).json({ urls });
 }

@@ -3,6 +3,8 @@ import { ApiError } from "@/utils/ApiError";
 import * as bookingService from "./service";
 import * as paymentService from "@/modules/payments/service";
 import { StripeAccountRef } from "@/modules/payments/stripeClients";
+import { assertPropertyScope } from "@/middleware/auth";
+import { maskEmail } from "@/utils/redact";
 
 // Guest starts checkout: creates a pending_payment hold (occupies the dates
 // immediately via the exclusion constraint) and a matching Stripe PaymentIntent.
@@ -65,29 +67,35 @@ export async function createOfflineBooking(req: Request, res: Response) {
   res.status(201).json(booking);
 }
 
-// Public, unauthenticated (this route has no requireAuth — the booking
-// confirmation page hits it directly with just the booking id). The id is a
-// random UUIDv4, which is a reasonable secrecy bar for the rest of the
-// booking, but a passport/ID number is meaningfully more sensitive than
-// that bar was ever meant to protect — stripped here regardless of id
-// entropy. See BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §6.2. This is a
-// response-shaping choice, not a service-layer one: bookingService.getBooking
-// is also used by admin-authed callers (cancelBooking, guestInfo's
-// assertBookingScope) that still need the real fields.
-//
-// Also strips two property-internal secrets found during testing of the
-// above (not named in the doc, but the same class of problem): the
-// embedded `property` include carries `icalExportToken` (our own calendar
-// export secret) and `airbnbIcalImportUrls` (each one embeds Airbnb's own
-// per-listing secret token) — neither has any business on a guest-facing
-// booking confirmation, and both would otherwise leak to anyone who learns
-// any booking id for that property.
+// Public, unauthenticated — the booking confirmation page and the payment-
+// status poll hit it with just the booking id. Returns only what those pages
+// render (BACKEND_CHANGES_SECURITY_AUDIT_FRONTEND.md M4): no name, phone, ID
+// document, PaymentIntent id or property secrets, and the email masked
+// ("c•••@gmail.com") for "a confirmation has been sent to …". Admin callers
+// use the scoped list endpoint instead, which returns the full rows.
 export async function getBooking(req: Request, res: Response) {
   const booking = await bookingService.getBooking(req.params.id);
   if (!booking) throw ApiError.notFound("Booking not found");
-  const { guestIdDocumentType: _type, guestIdDocumentNumber: _number, ...publicBooking } = booking;
-  const { icalExportToken: _icalToken, airbnbIcalImportUrls: _airbnbUrls, ...publicProperty } = publicBooking.property;
-  res.json({ ...publicBooking, property: publicProperty });
+  res.json({
+    id: booking.id,
+    status: booking.status,
+    propertyId: booking.propertyId,
+    property: { id: booking.property.id, name: booking.property.name, slug: booking.property.slug },
+    checkIn: booking.checkIn,
+    checkOut: booking.checkOut,
+    guests: booking.guests,
+    rooms: booking.rooms,
+    roomIds: booking.roomIds,
+    childrenUnder14: booking.childrenUnder14,
+    currency: booking.currency,
+    accommodationPrice: booking.accommodationPrice,
+    cityTax: booking.cityTax,
+    transportPrice: booking.transportPrice,
+    totalPrice: booking.totalPrice,
+    expiresAt: booking.expiresAt,
+    createdAt: booking.createdAt,
+    guestEmail: maskEmail(booking.guestEmail),
+  });
 }
 
 export async function listBookings(req: Request, res: Response) {
@@ -95,23 +103,13 @@ export async function listBookings(req: Request, res: Response) {
   res.json(await bookingService.listBookingsForProperty(req.params.propertyId, status));
 }
 
+// Guards, refund maths and the Stripe refund itself live in
+// bookingService.cancelBooking. A failed Stripe refund doesn't fail the
+// request (the booking IS cancelled) — it comes back as `refundError` on the
+// booking so the admin can see money is still owed.
 export async function cancelBooking(req: Request, res: Response) {
   const booking = await bookingService.getBooking(req.params.id);
   if (!booking) throw ApiError.notFound("Booking not found");
-
-  const { booking: cancelled, refundAmount } = await bookingService.cancelBooking(
-    req.params.id,
-    req.body.refundOverride,
-    req.body.reason
-  );
-
-  if (booking.stripePaymentIntentId && refundAmount > 0) {
-    await paymentService.refundPaymentIntent(
-      booking.property.stripeAccountRef as StripeAccountRef,
-      booking.stripePaymentIntentId,
-      refundAmount
-    );
-  }
-
-  res.json(cancelled);
+  assertPropertyScope(req, booking.propertyId);
+  res.json(await bookingService.cancelBooking(booking.id, req.body.refundOverride, req.body.reason));
 }

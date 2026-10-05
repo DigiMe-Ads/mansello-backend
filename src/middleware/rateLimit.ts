@@ -50,3 +50,17 @@ export const reviewLimiter = rateLimit({
     message: "You've posted several reviews recently — please try again in an hour.",
   },
 });
+
+// Public villa checkout — each attempt holds the dates and creates a Stripe
+// PaymentIntent. A real guest makes 1–3 attempts; 10 per 10 minutes leaves
+// room for retries without letting a script hold the calendar.
+export const bookingLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "rate_limited",
+    message: "Too many booking attempts from this connection — please wait a few minutes and try again.",
+  },
+});

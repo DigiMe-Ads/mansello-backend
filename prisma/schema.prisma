@@ -74,6 +74,7 @@ enum OrderStatus {
 enum ContactSubject {
   room_booking
   airport_transfer
+  tour_package
   marketplace
   other
 }
@@ -311,6 +312,8 @@ model Booking {
   cancelledAt           DateTime?
   refundAmount          Decimal?      @db.Decimal(10, 2)
   refundReason          String?
+  stripeRefundId        String? // set once the Stripe refund for a cancellation succeeds
+  refundError           String? // set instead when it fails — money still owed, retry from Stripe's dashboard
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
 
@@ -464,6 +467,8 @@ model Order {
   subtotal              Decimal     @db.Decimal(10, 2)
   total                 Decimal     @db.Decimal(10, 2)
   flaggedForReview      Boolean     @default(false)
+  stripeRefundId        String? // set once the Stripe refund for a cancellation/return succeeds
+  refundError           String? // set instead when it fails — money still owed, retry from Stripe's dashboard
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
