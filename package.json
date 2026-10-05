@@ -1,12 +1,12 @@
 {
   "name": "mansello-backend",
   "version": "0.1.0",
-  "description": "Backend API for Mansello — The Nest Bologna & Dona's Villa direct bookings, marketplace, and admin panel",
+  "description": "Backend API for Mansello \u2014 The Nest Bologna & Dona's Villa direct bookings, marketplace, and admin panel",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json && tsc-alias -p tsconfig.json",
-    "start": "node dist/index.js",
+    "start": "prisma migrate deploy && node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
@@ -29,6 +29,7 @@
     "multer": "^2.2.0",
     "node-cron": "^3.0.3",
     "node-ical": "^0.20.1",
+    "prisma": "^5.22.0",
     "resend": "^6.19.0",
     "sanitize-html": "^2.18.0",
     "stripe": "^16.9.0",
@@ -50,7 +51,6 @@
     "@typescript-eslint/eslint-plugin": "^8.5.0",
     "@typescript-eslint/parser": "^8.5.0",
     "eslint": "^8.57.0",
-    "prisma": "^5.22.0",
     "tsc-alias": "^1.9.1",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2"
