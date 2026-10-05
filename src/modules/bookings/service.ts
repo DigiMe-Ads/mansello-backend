@@ -148,9 +148,15 @@ export async function computeBookingPrice(
   // BACKEND_PLAN.md §4. Low-stakes enough not to warrant a locking scheme.
   // Applies at the whole-property level regardless of rooms — unaffected by
   // any of the room logic below.
+  //
+  // Half-open throughout ([startDate, endDate), endDate = checkout day):
+  // with no buffer, checking out on another stay's check-in day (or in on
+  // its checkout day) is NOT a conflict. A real overlap gets the plain
+  // "unavailable" message; only a stay that's merely too close blames the
+  // buffer, so the client can tell the setting is the reason.
   if (property.turnoverBufferDays > 0) {
     const bufferMs = property.turnoverBufferDays * MS_PER_DAY;
-    const tooClose = await prisma.availabilityBlock.findFirst({
+    const nearby = await prisma.availabilityBlock.findMany({
       where: {
         propertyId,
         status: "active",
@@ -158,9 +164,13 @@ export async function computeBookingPrice(
         endDate: { gt: new Date(checkIn.getTime() - bufferMs) },
       },
     });
-    if (tooClose) {
+    if (nearby.some((b) => b.startDate < checkOut && b.endDate > checkIn)) {
+      throw ApiError.conflict("These dates are no longer available for this property.");
+    }
+    if (nearby.length > 0) {
+      const days = property.turnoverBufferDays;
       throw ApiError.conflict(
-        `This property needs ${property.turnoverBufferDays} day(s) of turnover between bookings — these dates are too close to an existing booking or block.`
+        `These dates are too close to another booking (${days}-day cleaning buffer required).`
       );
     }
   }

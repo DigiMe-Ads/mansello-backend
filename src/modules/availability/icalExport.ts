@@ -25,6 +25,11 @@ router.get(
       calendar.createEvent({
         start: block.startDate,
         end: block.endDate,
+        // DTSTART;VALUE=DATE / DTEND;VALUE=DATE (exclusive end), never a UTC
+        // date-time: Airbnb/Booking.com read "T000000Z" in the listing's own
+        // timezone (02:00 in Bologna), which spills the block onto the
+        // checkout day and stops the next guest checking in that day.
+        allDay: true,
         summary: "Booked",
         id: block.id,
       });
