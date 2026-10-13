@@ -10,8 +10,10 @@ import { sendBookingConfirmation, sendLatePaymentRefund } from "@/modules/notifi
 // An email failure must not fail the webhook: Stripe would retry, the retry
 // would find the booking already confirmed, and the email would never be sent
 // at all (BACKEND_SECURITY_AUDIT.md M3). Logged for follow-up instead.
-async function sendConfirmationEmail(paymentIntentId: string) {
-  const booking = await bookings.getBookingByPaymentIntent(paymentIntentId);
+type BookingForEmail = Awaited<ReturnType<typeof bookings.getBooking>>;
+
+// Shared with the Payments.lk webhook (paymentsLkRoutes.ts).
+export async function emailBookingConfirmed(booking: BookingForEmail) {
   if (!booking) return;
   try {
     await sendBookingConfirmation(
@@ -26,8 +28,7 @@ async function sendConfirmationEmail(paymentIntentId: string) {
   }
 }
 
-async function sendLateRefundEmail(paymentIntentId: string) {
-  const booking = await bookings.getBookingByPaymentIntent(paymentIntentId);
+export async function emailLatePaymentRefund(booking: BookingForEmail) {
   if (!booking) return;
   try {
     await sendLatePaymentRefund(
@@ -40,6 +41,14 @@ async function sendLateRefundEmail(paymentIntentId: string) {
   } catch (err) {
     console.error(`Late-payment refund email failed for booking ${booking.id}:`, err);
   }
+}
+
+async function sendConfirmationEmail(paymentIntentId: string) {
+  await emailBookingConfirmed(await bookings.getBookingByPaymentIntent(paymentIntentId));
+}
+
+async function sendLateRefundEmail(paymentIntentId: string) {
+  await emailLatePaymentRefund(await bookings.getBookingByPaymentIntent(paymentIntentId));
 }
 
 function makeWebhookRouter(accountRef: "italy" | "sri_lanka") {

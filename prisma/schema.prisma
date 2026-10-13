@@ -314,6 +314,21 @@ model Booking {
   refundReason          String?
   stripeRefundId        String? // set once the Stripe refund for a cancellation succeeds
   refundError           String? // set instead when it fails — money still owed, retry from Stripe's dashboard
+  // Which processor took this payment — set when the checkout is created and
+  // never changed, so refunds go back through the same one even after the
+  // SRI_LANKA_PAYMENT_PROVIDER switch flips. See
+  // BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §3.
+  paymentProvider       String        @default("stripe") // "stripe" | "payments_lk"
+  paymentsLkCheckoutId  String?       @unique
+  paymentsLkPaymentId   String?       @unique
+  paymentsLkRefundId    String? // our latest Payments.lk refund request
+  fxRate                Decimal?      @db.Decimal(12, 6) // USD→LKR used for chargeAmount, when converted
+  chargeAmount          Decimal?      @db.Decimal(12, 2) // what the card is actually charged, in chargeCurrency
+  chargeCurrency        String? // "lkr" (or "usd")
+  refundStatus          String? // "pending" | "succeeded" | "failed" — Payments.lk refunds settle asynchronously
+  refundAttempts        Int           @default(0) // Payments.lk refund requests made so far (a refund asked before the payment settles fails, and is retried)
+  refundedChargeAmount  Decimal?      @db.Decimal(12, 2) // total refunded so far per Payments.lk, in chargeCurrency — includes refunds made outside this backend
+  paymentNote           String? // something an admin should look at, e.g. a refund made from the Payments.lk dashboard
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
 
@@ -371,12 +386,12 @@ model BookingInfoRequest {
 }
 
 model Category {
-  id          String    @id @default(uuid())
+  id          String     @id @default(uuid())
   name        String
-  slug        String    @unique
+  slug        String     @unique
   description String? // short blurb for the storefront's featured section
   imageUrl    String?
-  featured    Boolean   @default(false) // at most 4 across all categories, enforced in modules/marketplace/catalog/service.ts
+  featured    Boolean    @default(false) // at most 4 across all categories, enforced in modules/marketplace/catalog/service.ts
   // One level of nesting only — a subcategory's parent is always top-level,
   // enforced in modules/marketplace/catalog/service.ts.
   parentId    String?
@@ -401,9 +416,34 @@ model Product {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  stockLevel StockLevel?
+  stockLevel StockLevel? // product-level stock — only used while the product has no active variants
   orderItems OrderItem[]
   reviews    ProductReview[]
+  variants   ProductVariant[]
+}
+
+// Sellable options of one product (e.g. 80ml / 100ml), each with its own SKU,
+// price, weight and stock. A product with at least one ACTIVE variant is sold
+// only through its variants; its own priceUsd is kept equal to the lowest
+// active variant price, for listing/sorting. See
+// BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1.
+model ProductVariant {
+  id         String      @id @default(uuid())
+  productId  String
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name       String      @db.VarChar(80)
+  sku        String      @unique // also unique against Product.sku — checked in the catalog service
+  priceUsd   Decimal     @db.Decimal(10, 2)
+  weightKg   Decimal?    @db.Decimal(8, 3)
+  active     Boolean     @default(true)
+  sortOrder  Int         @default(0)
+  stockLevel StockLevel?
+  orderItems OrderItem[]
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@unique([productId, name])
+  @@index([productId])
 }
 
 // Public storefront reviews — publish immediately (no moderation queue yet),
@@ -441,13 +481,17 @@ model ShippingRate {
   updatedAt DateTime @updatedAt
 }
 
+// Exactly one of productId (a product without variants) or variantId is set —
+// enforced by a CHECK constraint in the migration.
 model StockLevel {
-  id                String   @id @default(uuid())
-  productId         String   @unique
-  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  quantityOnHand    Int      @default(0)
-  lowStockThreshold Int      @default(5)
-  updatedAt         DateTime @updatedAt
+  id                String          @id @default(uuid())
+  productId         String?         @unique
+  product           Product?        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId         String?         @unique
+  variant           ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  quantityOnHand    Int             @default(0)
+  lowStockThreshold Int             @default(5)
+  updatedAt         DateTime        @updatedAt
 }
 
 model Order {
@@ -469,6 +513,21 @@ model Order {
   flaggedForReview      Boolean     @default(false)
   stripeRefundId        String? // set once the Stripe refund for a cancellation/return succeeds
   refundError           String? // set instead when it fails — money still owed, retry from Stripe's dashboard
+  // Which processor took this payment — set when the checkout is created and
+  // never changed, so refunds go back through the same one even after the
+  // SRI_LANKA_PAYMENT_PROVIDER switch flips. See
+  // BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §3.
+  paymentProvider       String      @default("stripe") // "stripe" | "payments_lk"
+  paymentsLkCheckoutId  String?     @unique
+  paymentsLkPaymentId   String?     @unique
+  paymentsLkRefundId    String? // our latest Payments.lk refund request
+  fxRate                Decimal?    @db.Decimal(12, 6) // USD→LKR used for chargeAmount, when converted
+  chargeAmount          Decimal?    @db.Decimal(12, 2) // what the card is actually charged, in chargeCurrency
+  chargeCurrency        String? // "lkr" (or "usd")
+  refundStatus          String? // "pending" | "succeeded" | "failed" — Payments.lk refunds settle asynchronously
+  refundAttempts        Int         @default(0) // Payments.lk refund requests made so far (a refund asked before the payment settles fails, and is retried)
+  refundedChargeAmount  Decimal?    @db.Decimal(12, 2) // total refunded so far per Payments.lk, in chargeCurrency — includes refunds made outside this backend
+  paymentNote           String? // something an admin should look at, e.g. a refund made from the Payments.lk dashboard
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
@@ -479,15 +538,18 @@ model Order {
 }
 
 model OrderItem {
-  id                  String  @id @default(uuid())
+  id                  String          @id @default(uuid())
   orderId             String
-  order               Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  order               Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
   productId           String
-  product             Product @relation(fields: [productId], references: [id])
+  product             Product         @relation(fields: [productId], references: [id])
+  variantId           String?
+  variant             ProductVariant? @relation(fields: [variantId], references: [id])
+  variantNameSnapshot String? // like productNameSnapshot; rendered as "Product (80ml)"
   productNameSnapshot String
-  unitPriceSnapshot   Decimal @db.Decimal(10, 2)
+  unitPriceSnapshot   Decimal         @db.Decimal(10, 2)
   quantity            Int
-  lineTotal           Decimal @db.Decimal(10, 2)
+  lineTotal           Decimal         @db.Decimal(10, 2)
 }
 
 model ContactMessage {

@@ -4,6 +4,14 @@ import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
 import { slugify } from "@/utils/slugify";
 import { hasVisibleText, sanitizeDescription } from "@/utils/richText";
+import {
+  VariantInput,
+  applyStockDelta,
+  assertDistinctVariants,
+  assertSkuFree,
+  createVariantRows,
+  variantsInclude,
+} from "./variants";
 
 // Flat list — each row carries parentId (null for a top-level category) and
 // the frontend builds the one-level tree itself.
@@ -150,7 +158,7 @@ export async function listProducts(categorySlug?: string, includeInactive = fals
         ? { category: { OR: [{ slug: categorySlug }, { parent: { slug: categorySlug } }] } }
         : {}),
     },
-    include: { category: true, stockLevel: true },
+    include: { category: true, stockLevel: true, ...variantsInclude(includeInactive) },
     orderBy: { createdAt: "desc" },
   });
   return withRatings(products);
@@ -162,7 +170,7 @@ export async function listProducts(categorySlug?: string, includeInactive = fals
 export async function getProduct(id: string, includeInactive = false) {
   const product = await prisma.product.findFirst({
     where: { id, ...(includeInactive ? {} : { active: true }) },
-    include: { category: true, stockLevel: true },
+    include: { category: true, stockLevel: true, ...variantsInclude(includeInactive) },
   });
   if (!product) return null;
   const [withRating] = await withRatings([product]);
@@ -196,34 +204,62 @@ function cleanDescription(description: unknown): string {
   return clean;
 }
 
-export function createProduct(input: {
+// With `variants`, the product and every variation (each with its own stock)
+// are created in one transaction; the product-level initialStock /
+// lowStockThreshold / weightKg are ignored and priceUsd is the lowest
+// variation price. Without, a plain product exactly as before.
+export async function createProduct(input: {
   categoryId: string;
   name: string;
   description: string;
-  priceUsd: number;
+  priceUsd?: number;
   images: string[];
   sku: string;
   initialStock: number;
   lowStockThreshold?: number;
   weightKg?: number | null;
+  variants?: VariantInput[];
 }) {
-  return prisma.product.create({
-    data: {
+  const description = cleanDescription(input.description);
+  const variants = input.variants ?? [];
+
+  return prisma.$transaction(async (tx) => {
+    assertDistinctVariants(variants, input.sku);
+    for (const sku of [input.sku, ...variants.map((v) => v.sku)]) await assertSkuFree(tx, sku);
+
+    const base = {
       categoryId: input.categoryId,
       name: input.name,
-      description: cleanDescription(input.description),
-      priceUsd: input.priceUsd,
+      description,
       images: input.images,
       sku: input.sku,
-      weightKg: input.weightKg,
-      stockLevel: {
-        create: {
-          quantityOnHand: input.initialStock,
-          lowStockThreshold: input.lowStockThreshold ?? 5,
+    };
+
+    if (variants.length === 0) {
+      return tx.product.create({
+        data: {
+          ...base,
+          priceUsd: input.priceUsd!,
+          weightKg: input.weightKg,
+          stockLevel: {
+            create: {
+              quantityOnHand: input.initialStock,
+              lowStockThreshold: input.lowStockThreshold ?? 5,
+            },
+          },
         },
-      },
-    },
-    include: { stockLevel: true },
+        include: { stockLevel: true, ...variantsInclude(true) },
+      });
+    }
+
+    const product = await tx.product.create({
+      data: { ...base, priceUsd: Math.min(...variants.map((v) => v.priceUsd)), weightKg: null },
+    });
+    await createVariantRows(tx, product.id, variants);
+    return tx.product.findUniqueOrThrow({
+      where: { id: product.id },
+      include: { stockLevel: true, ...variantsInclude(true) },
+    });
   });
 }
 
@@ -269,22 +305,39 @@ export async function deleteProduct(id: string) {
   await prisma.product.delete({ where: { id } });
 }
 
-export function adjustStock(productId: string, delta: number) {
-  return prisma.stockLevel.update({
-    where: { productId },
-    data: { quantityOnHand: { increment: delta } },
-  });
+// A product with active variations keeps stock per variation — its own
+// row isn't used, so adjusting it would only confuse.
+export async function adjustStock(productId: string, delta: number) {
+  const variantCount = await prisma.productVariant.count({ where: { productId, active: true } });
+  if (variantCount > 0) {
+    throw ApiError.badRequest("This product has variations — adjust the stock of a specific variation");
+  }
+  return applyStockDelta({ productId }, delta);
 }
 
-// Prisma can't compare two columns of the same row in a `where`, so this is
-// a raw query rather than the usual findMany.
-export function listLowStock() {
-  return prisma.$queryRaw`
-    SELECT s.*, row_to_json(p.*) as product
-    FROM "StockLevel" s
-    JOIN "Product" p ON p.id = s."productId"
-    WHERE s."quantityOnHand" <= s."lowStockThreshold"
-  `;
+// Every stock row at or below its threshold — product-level rows for plain
+// products, variant rows (with `variant` populated) for the rest. Skips a
+// product-level row the product no longer uses (it has active variations)
+// and hidden variations. Filtered in memory: Prisma can't compare two
+// columns of a row, and the table is small (one row per sellable item).
+export async function listLowStock() {
+  const rows = await prisma.stockLevel.findMany({
+    include: {
+      product: { include: { variants: { where: { active: true }, select: { id: true } } } },
+      variant: { include: { product: true } },
+    },
+  });
+  return rows
+    .filter((r) => r.quantityOnHand <= r.lowStockThreshold)
+    .filter((r) => (r.variant ? r.variant.active : r.product && r.product.variants.length === 0))
+    .map(({ product, variant, ...level }) => {
+      if (variant) {
+        const { product: variantProduct, ...variantFields } = variant;
+        return { ...level, product: variantProduct, variant: variantFields };
+      }
+      const { variants: _variants, ...productFields } = product!;
+      return { ...level, product: productFields, variant: null };
+    });
 }
 
 // --- Reviews ---------------------------------------------------------------

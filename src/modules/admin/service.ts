@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { prisma } from "@/db/prisma";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
+import { listLowStock } from "@/modules/marketplace/catalog/service";
 import { AdminJwtPayload, JWT_VERIFY_OPTIONS } from "@/middleware/auth";
 
 function signTokens(payload: AdminJwtPayload) {
@@ -104,9 +105,8 @@ export async function getDashboard(admin: AdminJwtPayload) {
         where: { ...bookingScope, status: { in: ["confirmed", "paid_offline", "completed"] } },
         _sum: { totalPrice: true },
       }),
-      prisma.$queryRaw<{ count: bigint }[]>`
-        SELECT COUNT(*) as count FROM "StockLevel" WHERE "quantityOnHand" <= "lowStockThreshold"
-      `,
+      // Same rules as the low-stock list (variations counted, unused rows not).
+      listLowStock().then((rows) => rows.length),
       prisma.order.count({ where: { status: "pending" } }),
     ]);
 
@@ -114,7 +114,7 @@ export async function getDashboard(admin: AdminJwtPayload) {
     upcomingCheckIns,
     upcomingCheckOuts,
     revenueByProperty,
-    lowStockCount: seesMarketplace ? Number(lowStockCount[0]?.count ?? 0) : 0,
+    lowStockCount: seesMarketplace ? lowStockCount : 0,
     pendingOrdersCount: seesMarketplace ? pendingOrders : 0,
   };
 }

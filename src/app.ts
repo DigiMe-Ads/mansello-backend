@@ -10,6 +10,7 @@ import availabilityRoutes from "@/modules/availability/routes";
 import icalExportRoutes from "@/modules/availability/icalExport";
 import bookingsRoutes from "@/modules/bookings/routes";
 import { italyWebhookRouter, sriLankaWebhookRouter } from "@/modules/payments/webhooks";
+import { paymentsLkWebhookRouter, paymentsLkReturnRouter } from "@/modules/payments/paymentsLkRoutes";
 import catalogRoutes from "@/modules/marketplace/catalog/routes";
 import ordersRoutes from "@/modules/marketplace/orders/routes";
 import shippingRatesRoutes from "@/modules/marketplace/shipping/routes";
@@ -49,6 +50,7 @@ export function createApp() {
     (req.originalUrl || req.url || "")
       .replace(/^\/ical\/[^/?]+\.ics/, "/ical/***.ics")
       .replace(/^\/api\/booking-info-requests\/[^/?]+/, "/api/booking-info-requests/***")
+      .replace(/^(\/api\/payments-lk\/return\/cancel)\?.*/, "$1?***")
   );
   app.use(morgan(env.nodeEnv === "development" ? "dev" : "combined"));
 
@@ -56,6 +58,8 @@ export function createApp() {
   // mounted BEFORE express.json().
   app.use("/webhooks/stripe/italy", italyWebhookRouter);
   app.use("/webhooks/stripe/sri-lanka", sriLankaWebhookRouter);
+  // Same raw-body requirement for Payments.lk (Sri Lanka, after cutover).
+  app.use("/api/webhooks/payments-lk", paymentsLkWebhookRouter);
 
   app.use(express.json());
 
@@ -95,6 +99,7 @@ export function createApp() {
   app.use("/api/admin/properties", adminTransportRatesRoutes);
   app.use("/api/content", contentPublicRoutes);
   app.use("/api/admin/content", contentAdminRoutes);
+  app.use("/api/payments-lk/return", paymentsLkReturnRouter);
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);

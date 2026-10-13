@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { ApiError } from "@/utils/ApiError";
 import * as service from "./service";
+import * as variants from "./variants";
 import { uploadImage } from "@/modules/uploads/imageUpload";
 
 export async function listCategories(_req: Request, res: Response) {
@@ -80,4 +81,21 @@ export async function createReview(req: Request, res: Response) {
 export async function deleteReview(req: Request, res: Response) {
   await service.deleteReview(req.params.id);
   res.status(204).send();
+}
+
+export async function createVariant(req: Request, res: Response) {
+  res.status(201).json(await variants.createVariant(req.params.id, req.body));
+}
+
+export async function updateVariant(req: Request, res: Response) {
+  res.json(await variants.updateVariant(req.params.id, req.params.variantId, req.body));
+}
+
+export async function deleteVariant(req: Request, res: Response) {
+  await variants.deleteVariant(req.params.id, req.params.variantId);
+  res.status(204).send();
+}
+
+export async function adjustVariantStock(req: Request, res: Response) {
+  res.json(await variants.adjustVariantStock(req.params.id, req.params.variantId, req.body.delta));
 }

@@ -10,6 +10,8 @@ import {
   createProductSchema,
   updateProductSchema,
   stockAdjustmentSchema,
+  createVariantSchema,
+  updateVariantSchema,
 } from "./validation";
 import * as controller from "./controller";
 
@@ -50,6 +52,22 @@ router.post(
   asyncHandler(controller.adjustStock)
 );
 router.get("/low-stock", ...manager, asyncHandler(controller.listLowStock));
+
+// Admin — product variations (BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1).
+router.post("/products/:id/variants", ...manager, validate(createVariantSchema), asyncHandler(controller.createVariant));
+router.patch(
+  "/products/:id/variants/:variantId",
+  ...manager,
+  validate(updateVariantSchema),
+  asyncHandler(controller.updateVariant)
+);
+router.delete("/products/:id/variants/:variantId", ...manager, asyncHandler(controller.deleteVariant));
+router.post(
+  "/products/:id/variants/:variantId/stock-adjustment",
+  ...manager,
+  validate(stockAdjustmentSchema),
+  asyncHandler(controller.adjustVariantStock)
+);
 router.delete("/reviews/:id", ...manager, asyncHandler(controller.deleteReview));
 
 export default router;

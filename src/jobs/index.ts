@@ -5,6 +5,7 @@ import { runBookingExpiryJob } from "./bookingExpiry";
 import { runLowStockAlertJob } from "./lowStockAlert";
 import { runClickEventRetentionJob } from "./clickEventRetention";
 import { runOrderExpiryJob } from "./orderExpiry";
+import { retryFailedLkRefunds } from "@/modules/payments/lkRefunds";
 
 export function startJobs() {
   if (env.disableJobs) {
@@ -44,7 +45,16 @@ export function startJobs() {
     runOrderExpiryJob().catch((err) => console.error("Order expiry job failed:", err));
   });
 
+  // Once a day — Payments.lk refunds asked for before a card payment settled
+  // fail, and are asked for again (up to MAX_REFUND_ATTEMPTS). Runs after the
+  // Sri Lankan bank working day has started.
+  cron.schedule("0 6 * * *", () => {
+    retryFailedLkRefunds()
+      .then((n) => n > 0 && console.log(`Retried ${n} Payments.lk refund(s)`))
+      .catch((err) => console.error("Payments.lk refund retry job failed:", err));
+  });
+
   console.log(
-    "Scheduled jobs started (airbnb sync, booking expiry, low-stock alert, click-event retention, order expiry)"
+    "Scheduled jobs started (airbnb sync, booking expiry, low-stock alert, click-event retention, order expiry, Payments.lk refund retry)"
   );
 }

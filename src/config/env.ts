@@ -70,6 +70,30 @@ export const env = {
     privateBucket: process.env.S3_PRIVATE_BUCKET ?? "mansello-private",
   },
 
+  // Payments.lk (Sri Lanka card payments) — see
+  // BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §3. The live key wins
+  // when present, so going live is just adding PAYMENTS_LK_SECRET_KEY.
+  // Never log these.
+  paymentsLk: {
+    secretKey: process.env.PAYMENTS_LK_SECRET_KEY || process.env.PAYMENTS_LK_SANDBOX || "",
+    webhookSecret: process.env.PAYMENTS_LK_WEBHOOK_SECRET ?? "",
+    // Optional fixed USD→LKR rate, e.g. if the rate source is down. Normally
+    // the daily rate is fetched automatically.
+    usdLkrRateOverride: Number(process.env.USD_LKR_RATE) || null,
+  },
+  // Cutover switch for Dona's Villa bookings and marketplace orders. Italy is
+  // always Stripe. Each booking/order records its own provider, so flipping
+  // this never changes how an existing payment is refunded.
+  sriLankaPaymentProvider: (process.env.SRI_LANKA_PAYMENT_PROVIDER === "payments_lk" ? "payments_lk" : "stripe") as
+    | "stripe"
+    | "payments_lk",
+  // Where Payments.lk sends the customer back to (site) and our cancel route (API).
+  publicSiteUrl: (process.env.PUBLIC_SITE_URL || process.env.FRONTEND_URL || "http://localhost:3000").replace(/\/$/, ""),
+  publicApiUrl: (process.env.PUBLIC_API_URL || `http://localhost:${process.env.PORT ?? 4000}`).replace(/\/$/, ""),
+  // Operational alerts (payment limits, failed refunds). Falls back to the
+  // low-stock inbox; with neither set, alerts are only logged.
+  adminAlertEmail: process.env.ADMIN_ALERT_EMAIL || process.env.LOW_STOCK_ALERT_EMAIL || "",
+
   // Set to "true" for local development so `npm run dev` doesn't run the iCal
   // sync / expiry / email cron jobs against whatever database .env points at.
   disableJobs: process.env.DISABLE_JOBS === "true",

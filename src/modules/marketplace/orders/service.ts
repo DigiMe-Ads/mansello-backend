@@ -3,6 +3,9 @@ import { prisma } from "@/db/prisma";
 import { ApiError } from "@/utils/ApiError";
 import { computeShippingFee } from "@/modules/marketplace/shipping/service";
 import { cancelPaymentIntentQuietly, refundPaymentIntent } from "@/modules/payments/service";
+import { createCheckout, lkrCharge, toCents } from "@/modules/payments/paymentsLk";
+import { startLkRefund } from "@/modules/payments/lkRefunds";
+import { env } from "@/config/env";
 
 // The marketplace rides on the Sri Lanka Stripe account — see orders/controller.ts.
 const MARKETPLACE_STRIPE_ACCOUNT = "sri_lanka" as const;
@@ -11,12 +14,24 @@ const COD_ABUSE_THRESHOLD = 3; // cancelled/returned orders before flagging
 
 export interface OrderItemInput {
   productId: string;
+  variantId?: string;
   quantity: number;
+}
+
+// "Moisture Surge (80ml)" for a variation line, the product name otherwise —
+// how stock messages and emails name a line.
+function lineName(item: { productNameSnapshot: string; variantNameSnapshot?: string | null }) {
+  return item.variantNameSnapshot ? `${item.productNameSnapshot} (${item.variantNameSnapshot})` : item.productNameSnapshot;
 }
 
 // Guest checkout: price snapshot taken now, stock is NOT touched yet
 // (decremented at `confirmed` — see confirmOrder below) so browsing an
 // abandoned cart never ties up inventory.
+//
+// Variations (BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1): a product
+// with any active variation must be ordered as one of them, and that line is
+// priced, weighed and stock-checked from the variation; a product without
+// must not name one.
 export async function createOrder(input: {
   customerName: string;
   customerPhone: string;
@@ -24,33 +39,47 @@ export async function createOrder(input: {
   notes?: string;
   items: OrderItemInput[];
 }) {
+  const productIds = [...new Set(input.items.map((i) => i.productId))];
   const products = await prisma.product.findMany({
-    where: { id: { in: input.items.map((i) => i.productId) }, active: true },
-    include: { stockLevel: true },
+    where: { id: { in: productIds }, active: true },
+    include: { stockLevel: true, variants: { include: { stockLevel: true } } },
   });
-  if (products.length !== input.items.length) {
+  if (products.length !== productIds.length) {
     throw ApiError.badRequest("One or more products are unavailable");
   }
 
-  // Early, friendly check so the customer fixes their cart before paying.
-  // Not a reservation — stock is only taken at confirmation, which re-checks
-  // atomically (see takeStock).
-  for (const item of input.items) {
+  const lines = input.items.map((item) => {
     const product = products.find((p) => p.id === item.productId)!;
-    assertInStock(product.name, product.stockLevel?.quantityOnHand ?? 0, item.quantity);
-  }
+    const activeVariants = product.variants.filter((v) => v.active);
+    let variant: (typeof activeVariants)[number] | undefined;
+    if (activeVariants.length > 0) {
+      if (!item.variantId) throw ApiError.badRequest(`Please choose an option for ${product.name}`);
+      variant = activeVariants.find((v) => v.id === item.variantId);
+      if (!variant) {
+        throw ApiError.badRequest(`That option of ${product.name} is no longer available — please choose another`);
+      }
+    } else if (item.variantId) {
+      throw ApiError.badRequest(`${product.name} has no options — please remove it and add it to your cart again`);
+    }
 
-  const lineItems = input.items.map((item) => {
-    const product = products.find((p) => p.id === item.productId)!;
-    const unitPriceSnapshot = Number(product.priceUsd);
-    return {
+    const unitPriceSnapshot = Number(variant ? variant.priceUsd : product.priceUsd);
+    const line = {
       productId: product.id,
+      variantId: variant?.id ?? null,
       productNameSnapshot: product.name,
+      variantNameSnapshot: variant?.name ?? null,
       unitPriceSnapshot,
       quantity: item.quantity,
       lineTotal: unitPriceSnapshot * item.quantity,
     };
+    // Early, friendly check so the customer fixes their cart before paying.
+    // Not a reservation — stock is only taken at confirmation, which re-checks
+    // atomically (see takeStock).
+    const onHand = (variant ? variant.stockLevel : product.stockLevel)?.quantityOnHand ?? 0;
+    assertInStock(lineName(line), onHand, item.quantity);
+    return { line, weightKg: variant ? variant.weightKg : product.weightKg };
   });
+  const lineItems = lines.map((l) => l.line);
 
   const subtotal = lineItems.reduce((sum, i) => sum + i.lineTotal, 0);
   // Computed server-side from the submitted items' weight and the current
@@ -58,7 +87,7 @@ export async function createOrder(input: {
   // BACKEND_PLAN.md §7 left open (shippingFee used to be a flat,
   // client-supplied value); see
   // BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4.
-  const shippingFee = await computeShippingFee(input.items, products);
+  const shippingFee = await computeShippingFee(lines.map((l) => ({ weightKg: l.weightKg, quantity: l.line.quantity })));
   const total = subtotal + shippingFee;
 
   const priorAbuseCount = await prisma.order.count({
@@ -127,15 +156,28 @@ function assertInStock(name: string, onHand: number, wanted: number) {
 // Decrements each line's stock only if enough is on hand (a conditional
 // update, so two concurrent confirmations can't both take the last unit).
 // Throws a 409 naming the product otherwise, rolling back the transaction.
-async function takeStock(tx: Prisma.TransactionClient, items: { productId: string; quantity: number; productNameSnapshot: string }[]) {
+type StockLine = {
+  productId: string;
+  variantId: string | null;
+  quantity: number;
+  productNameSnapshot: string;
+  variantNameSnapshot: string | null;
+};
+
+// The stock row a line draws from: its variation's, or the product's own.
+function stockOwner(item: StockLine) {
+  return item.variantId ? { variantId: item.variantId } : { productId: item.productId };
+}
+
+async function takeStock(tx: Prisma.TransactionClient, items: StockLine[]) {
   for (const item of items) {
     const taken = await tx.stockLevel.updateMany({
-      where: { productId: item.productId, quantityOnHand: { gte: item.quantity } },
+      where: { ...stockOwner(item), quantityOnHand: { gte: item.quantity } },
       data: { quantityOnHand: { decrement: item.quantity } },
     });
     if (taken.count === 0) {
-      const level = await tx.stockLevel.findUnique({ where: { productId: item.productId } });
-      assertInStock(item.productNameSnapshot, level?.quantityOnHand ?? 0, item.quantity);
+      const level = await tx.stockLevel.findFirst({ where: stockOwner(item) });
+      assertInStock(lineName(item), level?.quantityOnHand ?? 0, item.quantity);
     }
   }
 }
@@ -171,15 +213,27 @@ export async function confirmOrder(orderId: string) {
 // — is refunded in full automatically rather than backordered
 // (BACKEND_CHANGES_SECURITY_AUDIT_FRONTEND.md C3/H2). An order that was
 // cancelled but CAN still be fulfilled is reinstated instead.
-export async function confirmOrderByPaymentIntent(
-  stripePaymentIntentId: string
-): Promise<"confirmed" | "refunded" | "refund_failed" | "nothing_to_do"> {
-  const order = await prisma.order.findFirst({
-    where: { stripePaymentIntentId },
-    include: { items: true },
-  });
+export type PaidOrderOutcome = "confirmed" | "refunded" | "refund_failed" | "nothing_to_do";
+
+export async function confirmOrderByPaymentIntent(stripePaymentIntentId: string): Promise<PaidOrderOutcome> {
+  const order = await prisma.order.findFirst({ where: { stripePaymentIntentId }, select: { id: true } });
+  return order ? fulfilPaidOrder(order.id) : "nothing_to_do";
+}
+
+// payment.succeeded from Payments.lk (amount already checked by the webhook).
+// Records the payment first, so a refund can reference it.
+export async function confirmPaymentsLkOrder(orderId: string, paymentId: string): Promise<PaidOrderOutcome> {
+  await prisma.order.updateMany({ where: { id: orderId, paymentsLkPaymentId: null }, data: { paymentsLkPaymentId: paymentId } });
+  return fulfilPaidOrder(orderId);
+}
+
+// Shared by both processors: confirm a pending order (taking stock), or
+// reinstate a cancelled one whose payment arrived late — and if the stock
+// isn't there any more, cancel and refund in full instead.
+async function fulfilPaidOrder(orderId: string): Promise<PaidOrderOutcome> {
+  const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: true } });
   if (!order) return "nothing_to_do";
-  const late = order.status === "cancelled" && !order.stripeRefundId;
+  const late = order.status === "cancelled" && !order.stripeRefundId && !order.refundStatus;
   if (order.status !== "pending" && !late) return "nothing_to_do"; // duplicate delivery
 
   try {
@@ -199,8 +253,36 @@ export async function confirmOrderByPaymentIntent(
   }
 
   await prisma.order.updateMany({ where: { id: order.id, status: "pending" }, data: { status: "cancelled" } });
-  const outcome = await refundOrder(order.id, stripePaymentIntentId, Number(order.total), `unfulfillable-order-${order.id}`);
-  return outcome;
+  if (order.paymentProvider === "payments_lk") {
+    // Requested now; retried daily until the payment has settled.
+    await startLkRefund("order", order.id, "Out of stock when the payment arrived");
+    return "refunded";
+  }
+  return refundOrder(order.id, order.stripePaymentIntentId!, Number(order.total), `unfulfillable-order-${order.id}`);
+}
+
+// Payments.lk checkout for a marketplace order (Sri Lanka, after cutover):
+// the USD total converted to LKR at today's rate and stored on the order.
+// The caller cancels the order if this throws.
+export async function startPaymentsLkCheckout(orderId: string) {
+  const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true } });
+  const charge = await lkrCharge(Number(order.total));
+  await prisma.order.update({ where: { id: orderId }, data: { paymentProvider: "payments_lk", ...charge } });
+
+  const units = order.items.reduce((n, i) => n + i.quantity, 0);
+  const checkout = await createCheckout({
+    kind: "order",
+    id: orderId,
+    amountCents: toCents(charge.chargeAmount),
+    description: `Mansello marketplace order, ${units} item${units === 1 ? "" : "s"}`,
+    successUrl: `${env.publicSiteUrl}/sri-lanka/marketplace/order/${orderId}`,
+  });
+  const updated = await prisma.order.update({
+    where: { id: orderId },
+    data: { paymentsLkCheckoutId: checkout.id },
+    include: { items: true },
+  });
+  return { order: updated, checkoutUrl: checkout.url };
 }
 
 // Records the Stripe refund's outcome on the order rather than throwing —
@@ -208,11 +290,14 @@ export async function confirmOrderByPaymentIntent(
 async function refundOrder(orderId: string, paymentIntentId: string, amount: number, idempotencyKey: string) {
   try {
     const refund = await refundPaymentIntent(MARKETPLACE_STRIPE_ACCOUNT, paymentIntentId, amount, idempotencyKey);
-    await prisma.order.update({ where: { id: orderId }, data: { stripeRefundId: refund?.id ?? null, refundError: null } });
+    await prisma.order.update({
+      where: { id: orderId },
+      data: { stripeRefundId: refund?.id ?? null, refundStatus: "succeeded", refundError: null },
+    });
     return "refunded" as const;
   } catch (err) {
     console.error(`Refund failed for order ${orderId} (PaymentIntent ${paymentIntentId}):`, err);
-    await prisma.order.update({ where: { id: orderId }, data: { refundError: (err as Error).message } });
+    await prisma.order.update({ where: { id: orderId }, data: { refundStatus: "failed", refundError: (err as Error).message } });
     return "refund_failed" as const;
   }
 }
@@ -246,9 +331,10 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
     });
     if (flipped.count === 0) throw ApiError.conflict("This order was changed by someone else — reload and try again");
     if (shouldRestock) {
+      // Back to the same row it was taken from (the variation's, if any).
       for (const item of order.items) {
-        await tx.stockLevel.update({
-          where: { productId: item.productId },
+        await tx.stockLevel.updateMany({
+          where: stockOwner(item),
           data: { quantityOnHand: { increment: item.quantity } },
         });
       }
@@ -261,7 +347,16 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
   //   unpayable so the customer can't still pay for it;
   // - a paid order being cancelled/returned → full refund, outcome recorded
   //   on the order (refunded once only — idempotency key per order).
-  if (order.stripePaymentIntentId && ["cancelled", "returned"].includes(nextStatus)) {
+  // Branches on the provider stored on the order, not the current switch.
+  if (order.paymentProvider === "payments_lk" && ["cancelled", "returned"].includes(nextStatus)) {
+    // A pending checkout can't be cancelled at Payments.lk (a late payment is
+    // refunded by the webhook backstop); a paid order is refunded in full,
+    // settled by the refund webhook.
+    if (order.status !== "pending") {
+      await startLkRefund("order", orderId, `Order ${nextStatus}`);
+      return prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true } });
+    }
+  } else if (order.stripePaymentIntentId && ["cancelled", "returned"].includes(nextStatus)) {
     if (order.status === "pending") {
       await cancelPaymentIntentQuietly(MARKETPLACE_STRIPE_ACCOUNT, order.stripePaymentIntentId);
     } else {

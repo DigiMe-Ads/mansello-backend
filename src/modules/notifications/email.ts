@@ -55,7 +55,7 @@ export function sendLatePaymentRefund(to: string, guestName: string, propertyNam
   return send(
     to,
     `Your payment for ${propertyName} has been refunded`,
-    `<p>Hi ${escapeHtml(guestName)},</p><p>Your payment for ${escapeHtml(propertyName)} (${escapeHtml(checkIn)} to ${escapeHtml(checkOut)}) arrived after your ${env.bookingHoldMinutes}-minute hold had expired, and those dates have since been booked. We've refunded the full amount — it should appear on your statement within 5–10 business days.</p><p>We're sorry for the trouble. Please check the calendar for other dates, or reply to this email and we'll help.</p>`
+    `<p>Hi ${escapeHtml(guestName)},</p><p>Your payment for ${escapeHtml(propertyName)} (${escapeHtml(checkIn)} to ${escapeHtml(checkOut)}) arrived after your ${env.bookingHoldMinutes}-minute hold had expired, and those dates have since been booked. We're refunding the full amount — depending on your bank it can take a few working days to start and 5–10 business days to appear on your statement.</p><p>We're sorry for the trouble. Please check the calendar for other dates, or reply to this email and we'll help.</p>`
   );
 }
 
@@ -74,4 +74,17 @@ export function sendGuestInfoRequest(to: string, guestName: string, propertyName
     `A few details for your stay at ${propertyName}`,
     `<p>Hi ${escapeHtml(guestName)},</p><p>Before your stay at ${escapeHtml(propertyName)}, could you fill in a few details for us?</p><p><a href="${safeLink}">${safeLink}</a></p>`
   );
+}
+
+// Operational alerts for the admin (payment limits, failed or outside
+// refunds). Never throws — an alert that can't be sent is logged, and must
+// not fail the webhook or job that raised it.
+export async function alertAdmin(subject: string, lines: string[]) {
+  console.warn(`[admin-alert] ${subject} — ${lines.join(" ")}`);
+  if (!env.adminAlertEmail) return;
+  try {
+    await send(env.adminAlertEmail, `[Mansello] ${subject}`, lines.map((l) => `<p>${escapeHtml(l)}</p>`).join(""));
+  } catch (err) {
+    console.error(`Admin alert email failed (${subject}):`, err);
+  }
 }

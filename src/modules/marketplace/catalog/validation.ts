@@ -30,6 +30,17 @@ export const updateCategorySchema = z.object({
   }),
 });
 
+// One sellable option of a product (BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1).
+const variantFields = {
+  name: z.string().trim().min(1).max(80),
+  sku: z.string().trim().min(1).max(100),
+  priceUsd: z.coerce.number().min(0).max(1_000_000),
+  weightKg: z.coerce.number().min(0).max(1000).nullable().optional(),
+  initialStock: z.coerce.number().int().min(0).max(1_000_000),
+  lowStockThreshold: z.coerce.number().int().min(0).max(1_000_000).optional(),
+};
+const variantBody = z.object(variantFields);
+
 // description is sanitized HTML (see utils/richText.ts) — length-checked
 // here, never rejected for containing markup.
 const MAX_DESCRIPTION = 10_000;
@@ -39,12 +50,19 @@ export const createProductSchema = z.object({
     categoryId: z.string().uuid(),
     name: z.string().trim().min(1).max(200),
     description: z.string().max(MAX_DESCRIPTION),
-    priceUsd: z.coerce.number().min(0).max(1_000_000),
+    // Derived from the variations when there are any, so optional then.
+    priceUsd: z.coerce.number().min(0).max(1_000_000).optional(),
     images: z.array(z.string().max(2000)).max(20).default([]),
     sku: z.string().trim().min(1).max(100),
-    initialStock: z.coerce.number().int().min(0).max(1_000_000),
+    initialStock: z.coerce.number().int().min(0).max(1_000_000).default(0),
     lowStockThreshold: z.coerce.number().int().min(0).max(1_000_000).optional(),
     weightKg: z.coerce.number().min(0).max(1000).nullable().optional(),
+    // Present and non-empty = create the product with these variations.
+    variants: z.array(variantBody).max(50).optional(),
+  })
+  .refine((b) => (b.variants?.length ?? 0) > 0 || b.priceUsd !== undefined, {
+    message: "priceUsd is required for a product without variations",
+    path: ["priceUsd"],
   }),
 });
 
@@ -68,5 +86,19 @@ export const stockAdjustmentSchema = z.object({
       .min(-1_000_000)
       .max(1_000_000)
       .refine((d) => d !== 0, "delta must not be 0"),
+  }),
+});
+
+export const createVariantSchema = z.object({ body: variantBody });
+
+export const updateVariantSchema = z.object({
+  body: z.object({
+    name: variantFields.name.optional(),
+    sku: variantFields.sku.optional(),
+    priceUsd: variantFields.priceUsd.optional(),
+    weightKg: variantFields.weightKg,
+    active: z.boolean().optional(),
+    sortOrder: z.coerce.number().int().min(0).max(10_000).optional(),
+    lowStockThreshold: variantFields.lowStockThreshold,
   }),
 });

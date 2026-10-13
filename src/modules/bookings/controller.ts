@@ -5,6 +5,7 @@ import * as paymentService from "@/modules/payments/service";
 import { StripeAccountRef } from "@/modules/payments/stripeClients";
 import { assertPropertyScope } from "@/middleware/auth";
 import { maskEmail } from "@/utils/redact";
+import { usesPaymentsLk } from "@/modules/payments/paymentsLk";
 
 // Guest starts checkout: creates a pending_payment hold (occupies the dates
 // immediately via the exclusion constraint) and a matching Stripe PaymentIntent.
@@ -26,6 +27,18 @@ export async function startBooking(req: Request, res: Response) {
     roomIds: req.body.roomIds,
     transportRequested: req.body.transportRequested,
   });
+
+  // Sri Lanka on Payments.lk (once switched over): a hosted checkout in LKR,
+  // and the frontend redirects to checkoutUrl. Everything else: Stripe.
+  if (usesPaymentsLk(property.stripeAccountRef)) {
+    try {
+      const { booking: withCharge, checkoutUrl } = await bookingService.startPaymentsLkCheckout(booking.id);
+      return res.status(201).json({ booking: withCharge, checkoutUrl, clientSecret: null });
+    } catch (err) {
+      await bookingService.releasePendingBooking(booking.id);
+      throw err;
+    }
+  }
 
   let intent;
   try {
@@ -92,6 +105,10 @@ export async function getBooking(req: Request, res: Response) {
     cityTax: booking.cityTax,
     transportPrice: booking.transportPrice,
     totalPrice: booking.totalPrice,
+    // The exact amount the card is charged (LKR for Payments.lk), when it
+    // differs from totalPrice's currency.
+    chargeAmount: booking.chargeAmount,
+    chargeCurrency: booking.chargeCurrency,
     expiresAt: booking.expiresAt,
     createdAt: booking.createdAt,
     guestEmail: maskEmail(booking.guestEmail),

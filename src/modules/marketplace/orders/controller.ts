@@ -3,6 +3,7 @@ import { ApiError } from "@/utils/ApiError";
 import * as paymentService from "@/modules/payments/service";
 import * as service from "./service";
 import { firstName, maskPhone } from "@/utils/redact";
+import { retrieveCheckout, usesPaymentsLk } from "@/modules/payments/paymentsLk";
 
 // The marketplace has only ever existed on the Sri Lanka site and has no
 // Stripe account of its own — it rides on the same "sri_lanka" account as
@@ -18,6 +19,18 @@ const MARKETPLACE_CURRENCY = "usd";
 // Stock is NOT touched here — see createOrder's own comment.
 export async function createOrder(req: Request, res: Response) {
   const order = await service.createOrder(req.body);
+
+  // After the Sri Lanka cutover: a Payments.lk hosted checkout in LKR, and the
+  // frontend redirects to checkoutUrl. Until then: Stripe, unchanged.
+  if (usesPaymentsLk(MARKETPLACE_STRIPE_ACCOUNT)) {
+    try {
+      const { order: withCharge, checkoutUrl } = await service.startPaymentsLkCheckout(order.id);
+      return res.status(201).json({ order: withCharge, checkoutUrl, clientSecret: null });
+    } catch (err) {
+      await service.releaseUnpaidOrder(order.id);
+      throw err;
+    }
+  }
 
   let intent;
   try {
@@ -57,6 +70,8 @@ export async function getOrder(req: Request, res: Response) {
       id: i.id,
       productId: i.productId,
       productNameSnapshot: i.productNameSnapshot,
+      variantId: i.variantId,
+      variantNameSnapshot: i.variantNameSnapshot,
       unitPriceSnapshot: i.unitPriceSnapshot,
       quantity: i.quantity,
       lineTotal: i.lineTotal,
@@ -64,6 +79,9 @@ export async function getOrder(req: Request, res: Response) {
     subtotal: order.subtotal,
     shippingFee: order.shippingFee,
     total: order.total,
+    // The exact amount the card is charged (LKR for Payments.lk).
+    chargeAmount: order.chargeAmount,
+    chargeCurrency: order.chargeCurrency,
     customerName: firstName(order.customerName),
     customerPhone: maskPhone(order.customerPhone),
   });
@@ -88,6 +106,18 @@ export async function updateOrderStatus(req: Request, res: Response) {
   // This still supports confirmOrder's documented recovery case — the
   // webhook was missed but the charge genuinely succeeded — just verifies
   // that against Stripe instead of trusting the request.
+  if (nextStatus === "confirmed" && before.status === "pending" && before.paymentProvider === "payments_lk") {
+    // Same recovery check for a Payments.lk order: its checkout's payment
+    // must really have succeeded. Recording the payment lets it be refunded.
+    if (!before.paymentsLkCheckoutId) throw ApiError.badRequest("This order has no checkout yet — nothing to confirm");
+    const checkout = await retrieveCheckout(before.paymentsLkCheckoutId);
+    if (checkout.payment.status !== "succeeded") {
+      throw ApiError.badRequest(`Payment status is "${checkout.payment.status}", not "succeeded" — refusing to confirm`);
+    }
+    const outcome = await service.confirmPaymentsLkOrder(before.id, checkout.payment.id);
+    if (outcome !== "confirmed") throw ApiError.conflict(`Could not confirm this order (${outcome})`);
+    return res.json(await service.getOrder(before.id));
+  }
   if (nextStatus === "confirmed" && before.status === "pending") {
     if (!before.stripePaymentIntentId) {
       throw ApiError.badRequest("This order has no PaymentIntent yet — nothing to confirm");

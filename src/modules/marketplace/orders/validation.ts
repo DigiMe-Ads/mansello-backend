@@ -18,14 +18,20 @@ export const createOrderSchema = z.object({
       .array(
         z.object({
           productId: z.string().uuid(),
+          // Required for a product with variations — checked in the service,
+          // which knows the product.
+          variantId: z.string().uuid().optional(),
           quantity: z.number().int().min(1).max(MAX_LINE_QUANTITY),
         })
       )
       .min(1, "Your cart is empty")
       .max(50)
-      .refine((items) => new Set(items.map((i) => i.productId)).size === items.length, {
-        message: "Each product may appear only once",
-      }),
+      // One line per product + variation: the same product in two sizes is
+      // two lines.
+      .refine(
+        (items) => new Set(items.map((i) => `${i.productId}:${i.variantId ?? ""}`)).size === items.length,
+        { message: "Each product option may appear only once" }
+      ),
   }),
 });
 

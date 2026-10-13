@@ -43,18 +43,17 @@ export async function replaceShippingRates(
 // where CreateOrderInput.shippingFee was a flat, client-supplied constant).
 // See BACKEND_CHANGES_PRICING_DISCOUNTS_SHIPPING.md §4 and
 // BACKEND_CHANGES_SHIPPING_FLAT_BAND_PRICING.md for the current algorithm.
-export async function computeShippingFee(
-  items: { productId: string; quantity: number }[],
-  products: { id: string; weightKg: unknown }[]
-): Promise<number> {
-  if (items.length === 0) return 0;
+//
+// Each line carries its own unit weight — the variation's for a variation
+// line, the product's otherwise (BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1).
+export async function computeShippingFee(lines: { weightKg: unknown; quantity: number }[]): Promise<number> {
+  if (lines.length === 0) return 0;
 
-  const totalWeightKgRaw = items.reduce((sum, item) => {
-    const product = products.find((p) => p.id === item.productId);
+  const totalWeightKgRaw = lines.reduce((sum, line) => {
     // null/absent weightKg (a product created before this field existed) is
     // treated as 0kg — still counts toward the cart being non-empty below.
-    const weight = product?.weightKg ? Number(product.weightKg) : 0;
-    return sum + weight * item.quantity;
+    const weight = line.weightKg ? Number(line.weightKg) : 0;
+    return sum + weight * line.quantity;
   }, 0);
 
   // Rounded up, minimum 1kg once the cart is non-empty (even an all-0kg
