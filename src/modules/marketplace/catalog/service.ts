@@ -1,4 +1,5 @@
 import { createHmac } from "crypto";
+import type { StockLevel } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
@@ -12,6 +13,7 @@ import {
   createVariantRows,
   variantsInclude,
 } from "./variants";
+import { withOfferPrices } from "./offers";
 
 // Flat list — each row carries parentId (null for a top-level category) and
 // the frontend builds the one-level tree itself.
@@ -161,7 +163,7 @@ export async function listProducts(categorySlug?: string, includeInactive = fals
     include: { category: true, stockLevel: true, ...variantsInclude(includeInactive) },
     orderBy: { createdAt: "desc" },
   });
-  return withRatings(products);
+  return withRatings(await withOfferPrices(products));
 }
 
 // Same admin-branch as listProducts, for consistency — an inactive product
@@ -173,7 +175,7 @@ export async function getProduct(id: string, includeInactive = false) {
     include: { category: true, stockLevel: true, ...variantsInclude(includeInactive) },
   });
   if (!product) return null;
-  const [withRating] = await withRatings([product]);
+  const [withRating] = await withRatings(await withOfferPrices([product]));
   return withRating;
 }
 
@@ -204,6 +206,25 @@ function cleanDescription(description: unknown): string {
   return clean;
 }
 
+// "Get it within X–Y days" — both bounds or neither, min ≤ max.
+export interface DeliveryEstimateInput {
+  deliveryEstimateEnabled?: boolean;
+  deliveryMinDays?: number | null;
+  deliveryMaxDays?: number | null;
+}
+
+function assertDeliveryEstimate(d: DeliveryEstimateInput, current?: DeliveryEstimateInput) {
+  const enabled = d.deliveryEstimateEnabled ?? current?.deliveryEstimateEnabled ?? false;
+  const min = d.deliveryMinDays !== undefined ? d.deliveryMinDays : current?.deliveryMinDays;
+  const max = d.deliveryMaxDays !== undefined ? d.deliveryMaxDays : current?.deliveryMaxDays;
+  if (enabled && (min == null || max == null)) {
+    throw ApiError.badRequest("Set both the earliest and latest delivery day to show a delivery estimate");
+  }
+  if (min != null && max != null && min > max) {
+    throw ApiError.badRequest("The earliest delivery day can't be after the latest");
+  }
+}
+
 // With `variants`, the product and every variation (each with its own stock)
 // are created in one transaction; the product-level initialStock /
 // lowStockThreshold / weightKg are ignored and priceUsd is the lowest
@@ -219,8 +240,9 @@ export async function createProduct(input: {
   lowStockThreshold?: number;
   weightKg?: number | null;
   variants?: VariantInput[];
-}) {
+} & DeliveryEstimateInput) {
   const description = cleanDescription(input.description);
+  assertDeliveryEstimate(input);
   const variants = input.variants ?? [];
 
   return prisma.$transaction(async (tx) => {
@@ -233,6 +255,9 @@ export async function createProduct(input: {
       description,
       images: input.images,
       sku: input.sku,
+      deliveryEstimateEnabled: input.deliveryEstimateEnabled ?? false,
+      deliveryMinDays: input.deliveryMinDays ?? null,
+      deliveryMaxDays: input.deliveryMaxDays ?? null,
     };
 
     if (variants.length === 0) {
@@ -263,7 +288,7 @@ export async function createProduct(input: {
   });
 }
 
-export function updateProduct(
+export async function updateProduct(
   id: string,
   data: Partial<{
     categoryId: string;
@@ -273,7 +298,8 @@ export function updateProduct(
     images: string[];
     active: boolean;
     weightKg: number | null;
-  }>
+  }> &
+    DeliveryEstimateInput
   // Same trust level as createProduct — categoryId isn't pre-validated
   // against Category here either; an unknown id surfaces as the FK
   // constraint rejecting the write, not a clean ApiError. Lets an admin
@@ -281,27 +307,21 @@ export function updateProduct(
   // deleting it (see deleteCategory above).
 ) {
   if (data.description !== undefined) data.description = cleanDescription(data.description);
+  const current = await prisma.product.findUnique({ where: { id } });
+  if (!current) throw ApiError.notFound("Product not found");
+  assertDeliveryEstimate(data, current);
   return prisma.product.update({ where: { id }, data });
 }
 
-// A product that's actually been ordered keeps its row referenced by
-// OrderItem (which snapshots name/price at time of purchase, so historical
-// orders don't depend on the product still existing) — hard-deleting it
-// would break that FK for no good reason. Deactivating (already-supported
-// via PATCH { active: false }) is the right move there instead; a genuine
-// leftover-test product with no order history deletes cleanly, and its
-// StockLevel row cascades with it.
+// Past orders don't depend on the product still existing: every OrderItem
+// snapshots its name, option, SKU and price, and its productId/variantId
+// are set to NULL by the FK when the product goes (migration
+// 20261020000000_marketplace_offers_stock). Variations, stock, offers and
+// reviews cascade with it. An order still awaiting payment that contains
+// it is refunded if the payment lands (see takeStock in orders/service.ts).
 export async function deleteProduct(id: string) {
   const product = await prisma.product.findUnique({ where: { id } });
   if (!product) throw ApiError.notFound("Product not found");
-
-  const orderItemCount = await prisma.orderItem.count({ where: { productId: id } });
-  if (orderItemCount > 0) {
-    throw ApiError.conflict(
-      "This product has order history and can't be deleted — deactivate it instead (PATCH active: false)"
-    );
-  }
-
   await prisma.product.delete({ where: { id } });
 }
 
@@ -338,6 +358,64 @@ export async function listLowStock() {
       const { variants: _variants, ...productFields } = product!;
       return { ...level, product: productFields, variant: null };
     });
+}
+
+// --- Stock tab ---------------------------------------------------------------
+// One row per sellable item: a plain product, or each variation of a product
+// that has them (a product's own row is skipped once it sells per variation).
+
+type StockRow = {
+  productId: string;
+  productName: string;
+  productActive: boolean;
+  categoryName: string;
+  image: string | null;
+  variantId: string | null;
+  variantName: string | null;
+  variantActive: boolean;
+  sku: string;
+  stockLevel: StockLevel;
+};
+
+export async function listStock(): Promise<StockRow[]> {
+  const products = await prisma.product.findMany({
+    include: { category: true, stockLevel: true, variants: { orderBy: { sortOrder: "asc" }, include: { stockLevel: true } } },
+    orderBy: { name: "asc" },
+  });
+  return products.flatMap((p): StockRow[] => {
+    const base = {
+      productId: p.id,
+      productName: p.name,
+      productActive: p.active,
+      categoryName: p.category.name,
+      image: p.images[0] ?? null,
+    };
+    const activeVariants = p.variants.filter((v) => v.active);
+    if (p.variants.length === 0 || activeVariants.length === 0) {
+      return p.stockLevel
+        ? [{ ...base, variantId: null, variantName: null, variantActive: true, sku: p.sku, stockLevel: p.stockLevel }]
+        : [];
+    }
+    return p.variants
+      .filter((v) => v.stockLevel)
+      .map((v) => ({
+        ...base,
+        image: v.images[0] ?? base.image,
+        variantId: v.id,
+        variantName: v.name,
+        variantActive: v.active,
+        sku: v.sku,
+        stockLevel: v.stockLevel!,
+      }));
+  });
+}
+
+// Sets the counted quantity (and/or alert threshold) directly — what a stock
+// take needs, rather than working out a +/- delta.
+export async function setStockLevel(id: string, data: { quantityOnHand?: number; lowStockThreshold?: number }) {
+  const level = await prisma.stockLevel.findUnique({ where: { id } });
+  if (!level) throw ApiError.notFound("Stock record not found");
+  return prisma.stockLevel.update({ where: { id }, data });
 }
 
 // --- Reviews ---------------------------------------------------------------

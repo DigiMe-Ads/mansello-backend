@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { ApiError } from "@/utils/ApiError";
 import * as service from "./service";
 import * as variants from "./variants";
+import * as offers from "./offers";
 import { uploadImage } from "@/modules/uploads/imageUpload";
 
 export async function listCategories(_req: Request, res: Response) {
@@ -68,6 +69,31 @@ export async function adjustStock(req: Request, res: Response) {
 
 export async function listLowStock(_req: Request, res: Response) {
   res.json(await service.listLowStock());
+}
+
+export async function listStock(_req: Request, res: Response) {
+  res.json(await service.listStock());
+}
+
+export async function setStockLevel(req: Request, res: Response) {
+  res.json(await service.setStockLevel(req.params.id, req.body));
+}
+
+export async function listOffers(_req: Request, res: Response) {
+  res.json(await offers.listOffers());
+}
+
+export async function createOffer(req: Request, res: Response) {
+  res.status(201).json(await offers.createOffer(req.params.id, req.body));
+}
+
+export async function updateOffer(req: Request, res: Response) {
+  res.json(await offers.updateOffer(req.params.offerId, req.body));
+}
+
+export async function deleteOffer(req: Request, res: Response) {
+  await offers.deleteOffer(req.params.offerId);
+  res.status(204).send();
 }
 
 export async function listReviews(req: Request, res: Response) {

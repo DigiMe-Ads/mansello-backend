@@ -6,6 +6,7 @@ import { cancelPaymentIntentQuietly, refundPaymentIntent } from "@/modules/payme
 import { createCheckout, lkrCharge, toCents } from "@/modules/payments/paymentsLk";
 import { startLkRefund } from "@/modules/payments/lkRefunds";
 import { env } from "@/config/env";
+import { bestOffer, discounted, runningOffers } from "@/modules/marketplace/catalog/offers";
 
 // The marketplace rides on the Sri Lanka Stripe account — see orders/controller.ts.
 const MARKETPLACE_STRIPE_ACCOUNT = "sri_lanka" as const;
@@ -47,6 +48,9 @@ export async function createOrder(input: {
   if (products.length !== productIds.length) {
     throw ApiError.badRequest("One or more products are unavailable");
   }
+  // Offers running right now — the price the shop showed may have changed
+  // since the item went in the cart, and this is what's charged.
+  const offers = await runningOffers(prisma, productIds);
 
   const lines = input.items.map((item) => {
     const product = products.find((p) => p.id === item.productId)!;
@@ -62,13 +66,18 @@ export async function createOrder(input: {
       throw ApiError.badRequest(`${product.name} has no options — please remove it and add it to your cart again`);
     }
 
-    const unitPriceSnapshot = Number(variant ? variant.priceUsd : product.priceUsd);
+    const listPrice = Number(variant ? variant.priceUsd : product.priceUsd);
+    const offer = bestOffer(offers, product.id, variant?.id ?? null);
+    const unitPriceSnapshot = offer ? discounted(listPrice, offer.discountPercent) : listPrice;
     const line = {
       productId: product.id,
       variantId: variant?.id ?? null,
       productNameSnapshot: product.name,
       variantNameSnapshot: variant?.name ?? null,
+      skuSnapshot: variant ? variant.sku : product.sku,
       unitPriceSnapshot,
+      listPriceSnapshot: offer ? listPrice : null,
+      discountPercent: offer?.discountPercent ?? null,
       quantity: item.quantity,
       lineTotal: unitPriceSnapshot * item.quantity,
     };
@@ -157,7 +166,7 @@ function assertInStock(name: string, onHand: number, wanted: number) {
 // update, so two concurrent confirmations can't both take the last unit).
 // Throws a 409 naming the product otherwise, rolling back the transaction.
 type StockLine = {
-  productId: string;
+  productId: string | null;
   variantId: string | null;
   quantity: number;
   productNameSnapshot: string;
@@ -165,18 +174,24 @@ type StockLine = {
 };
 
 // The stock row a line draws from: its variation's, or the product's own.
+// Null when what was ordered has since been deleted (the FK nulls the ids) —
+// never `{ productId: null }`, which would match every variation's row.
 function stockOwner(item: StockLine) {
-  return item.variantId ? { variantId: item.variantId } : { productId: item.productId };
+  if (item.variantId) return { variantId: item.variantId };
+  if (item.variantNameSnapshot || !item.productId) return null;
+  return { productId: item.productId };
 }
 
 async function takeStock(tx: Prisma.TransactionClient, items: StockLine[]) {
   for (const item of items) {
+    const owner = stockOwner(item);
+    if (!owner) throw ApiError.conflict(`${lineName(item)} is no longer sold`);
     const taken = await tx.stockLevel.updateMany({
-      where: { ...stockOwner(item), quantityOnHand: { gte: item.quantity } },
+      where: { ...owner, quantityOnHand: { gte: item.quantity } },
       data: { quantityOnHand: { decrement: item.quantity } },
     });
     if (taken.count === 0) {
-      const level = await tx.stockLevel.findFirst({ where: stockOwner(item) });
+      const level = await tx.stockLevel.findFirst({ where: owner });
       assertInStock(lineName(item), level?.quantityOnHand ?? 0, item.quantity);
     }
   }
@@ -332,9 +347,12 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
     if (flipped.count === 0) throw ApiError.conflict("This order was changed by someone else — reload and try again");
     if (shouldRestock) {
       // Back to the same row it was taken from (the variation's, if any).
+      // Skips lines whose product has been deleted since.
       for (const item of order.items) {
+        const owner = stockOwner(item);
+        if (!owner) continue;
         await tx.stockLevel.updateMany({
-          where: stockOwner(item),
+          where: owner,
           data: { quantityOnHand: { increment: item.quantity } },
         });
       }

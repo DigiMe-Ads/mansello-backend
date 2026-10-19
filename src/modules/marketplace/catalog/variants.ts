@@ -14,6 +14,7 @@ export interface VariantInput {
   weightKg?: number | null;
   initialStock: number;
   lowStockThreshold?: number;
+  images?: string[];
 }
 
 const DEFAULT_LOW_STOCK_THRESHOLD = 5;
@@ -72,6 +73,7 @@ export function createVariantRows(db: Db, productId: string, variants: VariantIn
           sku: v.sku.trim(),
           priceUsd: v.priceUsd,
           weightKg: v.weightKg ?? null,
+          images: v.images ?? [],
           sortOrder: firstSortOrder + i,
           stockLevel: {
             create: {
@@ -143,6 +145,7 @@ export async function updateVariant(
     active: boolean;
     sortOrder: number;
     lowStockThreshold: number;
+    images: string[];
   }>
 ) {
   return prisma.$transaction(async (tx) => {
@@ -171,17 +174,11 @@ export async function updateVariant(
   });
 }
 
-// Same "has history" rule as products: a variation that was ever ordered
-// can't be deleted (its order lines reference it) — hide it instead.
+// Like products, a variation with order history can be deleted: its order
+// lines keep their snapshots and their variantId is set to NULL by the FK.
 export async function deleteVariant(productId: string, variantId: string) {
   await prisma.$transaction(async (tx) => {
     await getVariantOf(tx, productId, variantId);
-    const ordered = await tx.orderItem.count({ where: { variantId } });
-    if (ordered > 0) {
-      throw ApiError.conflict(
-        "This variation has order history and can't be deleted — hide it from the shop instead (PATCH active: false)"
-      );
-    }
     await tx.productVariant.delete({ where: { id: variantId } });
     await recomputeProductPrice(tx, productId);
   });

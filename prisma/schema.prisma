@@ -31,6 +31,13 @@ enum AvailabilitySource {
   booking_com // iCal import from ical.booking.com — anything else unrecognised stays `airbnb`
 }
 
+// See migration 20261019000000_imported_block_kind. Null for direct/manual
+// blocks and for Booking.com events we can't classify.
+enum ImportedBlockKind {
+  reservation // Airbnb "Reserved" — a real guest stay
+  blocked // closed on the channel but not a booking (Airbnb "Not available", Booking.com window closures)
+}
+
 enum BlockStatus {
   active
   cancelled
@@ -275,6 +282,7 @@ model AvailabilityBlock {
   source      AvailabilitySource
   status      BlockStatus        @default(active)
   externalUid String? // Airbnb UID, used to dedupe on re-sync
+  importKind  ImportedBlockKind? // imported blocks only: reservation vs merely closed on the channel
   bookingId   String? // no longer unique — a room booking creates one block per reserved room, all sharing one bookingId
   booking     Booking?           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   createdAt   DateTime           @default(now())
@@ -403,23 +411,51 @@ model Category {
 }
 
 model Product {
-  id          String   @id @default(uuid())
-  categoryId  String
-  category    Category @relation(fields: [categoryId], references: [id])
-  name        String
-  description String // sanitized HTML subset (see utils/richText.ts) — or legacy plain text
-  priceUsd    Decimal  @db.Decimal(10, 2)
-  images      String[]
-  sku         String   @unique
-  active      Boolean  @default(true)
-  weightKg    Decimal? @db.Decimal(10, 3) // kg per single unit; null/absent (e.g. a pre-existing product) treated as 0kg for shipping purposes
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                      String   @id @default(uuid())
+  categoryId              String
+  category                Category @relation(fields: [categoryId], references: [id])
+  name                    String
+  description             String // sanitized HTML subset (see utils/richText.ts) — or legacy plain text
+  priceUsd                Decimal  @db.Decimal(10, 2)
+  images                  String[]
+  sku                     String   @unique
+  active                  Boolean  @default(true)
+  weightKg                Decimal? @db.Decimal(10, 3) // kg per single unit; null/absent (e.g. a pre-existing product) treated as 0kg for shipping purposes
+  // "Get it within X–Y days" on the storefront — shown only when enabled and
+  // both bounds are set (see migration 20261020000000_marketplace_offers_stock).
+  deliveryEstimateEnabled Boolean  @default(false)
+  deliveryMinDays         Int?
+  deliveryMaxDays         Int?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 
   stockLevel StockLevel? // product-level stock — only used while the product has no active variants
   orderItems OrderItem[]
   reviews    ProductReview[]
   variants   ProductVariant[]
+  offers     ProductOffer[]
+}
+
+// Time-limited % off a product (variantId null = every option of it) or one
+// of its variations. The best running offer for a line wins; prices are
+// worked out server-side at checkout (marketplace/catalog/offers.ts), never
+// trusted from the cart.
+model ProductOffer {
+  id              String          @id @default(uuid())
+  productId       String
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantId       String?
+  variant         ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  title           String?         @db.VarChar(80) // optional badge text, e.g. "Avurudu sale"
+  discountPercent Int // 1–90
+  startsAt        DateTime
+  endsAt          DateTime
+  active          Boolean         @default(true) // pause without deleting
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([productId])
+  @@index([variantId])
 }
 
 // Sellable options of one product (e.g. 80ml / 100ml), each with its own SKU,
@@ -428,19 +464,21 @@ model Product {
 // active variant price, for listing/sorting. See
 // BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1.
 model ProductVariant {
-  id         String      @id @default(uuid())
+  id         String         @id @default(uuid())
   productId  String
-  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  name       String      @db.VarChar(80)
-  sku        String      @unique // also unique against Product.sku — checked in the catalog service
-  priceUsd   Decimal     @db.Decimal(10, 2)
-  weightKg   Decimal?    @db.Decimal(8, 3)
-  active     Boolean     @default(true)
-  sortOrder  Int         @default(0)
+  product    Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name       String         @db.VarChar(80)
+  sku        String         @unique // also unique against Product.sku — checked in the catalog service
+  priceUsd   Decimal        @db.Decimal(10, 2)
+  weightKg   Decimal?       @db.Decimal(8, 3)
+  active     Boolean        @default(true)
+  sortOrder  Int            @default(0)
+  images     String[]       @default([]) // shown when this option is picked; falls back to the product's images
   stockLevel StockLevel?
   orderItems OrderItem[]
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @updatedAt
+  offers     ProductOffer[]
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
 
   @@unique([productId, name])
   @@index([productId])
@@ -541,13 +579,18 @@ model OrderItem {
   id                  String          @id @default(uuid())
   orderId             String
   order               Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId           String
-  product             Product         @relation(fields: [productId], references: [id])
+  // Both null once the product/variation is deleted — the line keeps its
+  // own name and price snapshots, so past orders still read and total right.
+  productId           String?
+  product             Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
   variantId           String?
-  variant             ProductVariant? @relation(fields: [variantId], references: [id])
+  variant             ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
   variantNameSnapshot String? // like productNameSnapshot; rendered as "Product (80ml)"
   productNameSnapshot String
-  unitPriceSnapshot   Decimal         @db.Decimal(10, 2)
+  skuSnapshot         String? // SKU at time of purchase
+  unitPriceSnapshot   Decimal         @db.Decimal(10, 2) // what was charged per unit, after any offer
+  listPriceSnapshot   Decimal?        @db.Decimal(10, 2) // the price before the offer, when one applied
+  discountPercent     Int? // the offer applied to this line, if any
   quantity            Int
   lineTotal           Decimal         @db.Decimal(10, 2)
 }

@@ -38,8 +38,16 @@ const variantFields = {
   weightKg: z.coerce.number().min(0).max(1000).nullable().optional(),
   initialStock: z.coerce.number().int().min(0).max(1_000_000),
   lowStockThreshold: z.coerce.number().int().min(0).max(1_000_000).optional(),
+  images: z.array(z.string().max(2000)).max(10).optional(),
 };
 const variantBody = z.object(variantFields);
+
+const deliveryDays = z.coerce.number().int().min(0).max(365).nullable().optional();
+const deliveryFields = {
+  deliveryEstimateEnabled: z.boolean().optional(),
+  deliveryMinDays: deliveryDays,
+  deliveryMaxDays: deliveryDays,
+};
 
 // description is sanitized HTML (see utils/richText.ts) — length-checked
 // here, never rejected for containing markup.
@@ -59,6 +67,7 @@ export const createProductSchema = z.object({
     weightKg: z.coerce.number().min(0).max(1000).nullable().optional(),
     // Present and non-empty = create the product with these variations.
     variants: z.array(variantBody).max(50).optional(),
+    ...deliveryFields,
   })
   .refine((b) => (b.variants?.length ?? 0) > 0 || b.priceUsd !== undefined, {
     message: "priceUsd is required for a product without variations",
@@ -75,6 +84,7 @@ export const updateProductSchema = z.object({
     images: z.array(z.string().max(2000)).max(20).optional(),
     active: z.boolean().optional(),
     weightKg: z.coerce.number().min(0).max(1000).nullable().optional(),
+    ...deliveryFields,
   }),
 });
 
@@ -100,5 +110,39 @@ export const updateVariantSchema = z.object({
     active: z.boolean().optional(),
     sortOrder: z.coerce.number().int().min(0).max(10_000).optional(),
     lowStockThreshold: variantFields.lowStockThreshold,
+    images: variantFields.images,
+  }),
+});
+
+export const setStockLevelSchema = z.object({
+  body: z
+    .object({
+      quantityOnHand: z.coerce.number().int().min(0).max(1_000_000).optional(),
+      lowStockThreshold: z.coerce.number().int().min(0).max(1_000_000).optional(),
+    })
+    .refine((b) => b.quantityOnHand !== undefined || b.lowStockThreshold !== undefined, "Nothing to change"),
+});
+
+// Offers take full timestamps — the admin picks local date/times and the
+// browser sends them as ISO strings.
+const offerFields = {
+  variantId: z.union([z.string().uuid(), z.literal(""), z.null()]).optional(),
+  title: z.string().trim().max(80).nullable().optional(),
+  discountPercent: z.coerce.number().int().min(1).max(90),
+  startsAt: z.coerce.date(),
+  endsAt: z.coerce.date(),
+  active: z.boolean().optional(),
+};
+
+export const createOfferSchema = z.object({ body: z.object(offerFields) });
+
+export const updateOfferSchema = z.object({
+  body: z.object({
+    variantId: offerFields.variantId,
+    title: offerFields.title,
+    discountPercent: offerFields.discountPercent.optional(),
+    startsAt: offerFields.startsAt.optional(),
+    endsAt: offerFields.endsAt.optional(),
+    active: offerFields.active,
   }),
 });

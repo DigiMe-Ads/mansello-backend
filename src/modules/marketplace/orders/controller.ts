@@ -73,6 +73,8 @@ export async function getOrder(req: Request, res: Response) {
       variantId: i.variantId,
       variantNameSnapshot: i.variantNameSnapshot,
       unitPriceSnapshot: i.unitPriceSnapshot,
+      listPriceSnapshot: i.listPriceSnapshot,
+      discountPercent: i.discountPercent,
       quantity: i.quantity,
       lineTotal: i.lineTotal,
     })),

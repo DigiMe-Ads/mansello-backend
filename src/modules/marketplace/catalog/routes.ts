@@ -12,6 +12,9 @@ import {
   stockAdjustmentSchema,
   createVariantSchema,
   updateVariantSchema,
+  setStockLevelSchema,
+  createOfferSchema,
+  updateOfferSchema,
 } from "./validation";
 import * as controller from "./controller";
 
@@ -52,6 +55,14 @@ router.post(
   asyncHandler(controller.adjustStock)
 );
 router.get("/low-stock", ...manager, asyncHandler(controller.listLowStock));
+router.get("/stock", ...manager, asyncHandler(controller.listStock));
+router.patch("/stock/:id", ...manager, validate(setStockLevelSchema), asyncHandler(controller.setStockLevel));
+
+// Admin — time-limited offers on products / their variations.
+router.get("/offers", ...manager, asyncHandler(controller.listOffers));
+router.post("/products/:id/offers", ...manager, validate(createOfferSchema), asyncHandler(controller.createOffer));
+router.patch("/offers/:offerId", ...manager, validate(updateOfferSchema), asyncHandler(controller.updateOffer));
+router.delete("/offers/:offerId", ...manager, asyncHandler(controller.deleteOffer));
 
 // Admin — product variations (BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §1).
 router.post("/products/:id/variants", ...manager, validate(createVariantSchema), asyncHandler(controller.createVariant));
