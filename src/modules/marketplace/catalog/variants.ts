@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { ApiError } from "@/utils/ApiError";
@@ -18,6 +19,11 @@ export interface VariantInput {
 }
 
 const DEFAULT_LOW_STOCK_THRESHOLD = 5;
+
+// Interactive transactions here make several sequential round trips to the
+// database (Supabase, far from Railway); Prisma's 5s default was too short
+// for a product with many variations (P2028 "Transaction already closed").
+export const TX_OPTIONS = { maxWait: 10_000, timeout: 20_000 } as const;
 
 // How every response shapes a product's variants: ordered, with their stock.
 // Public callers see only active ones.
@@ -48,6 +54,53 @@ export async function assertSkuFree(db: Db, sku: string, except: { productId?: s
   }
 }
 
+// Same rule as assertSkuFree for many SKUs at once — two queries in total
+// rather than two per SKU.
+export async function assertSkusFree(db: Db, skus: string[]) {
+  const [products, variants] = await Promise.all([
+    db.product.findMany({ where: { sku: { in: skus } }, select: { sku: true, name: true } }),
+    db.productVariant.findMany({
+      where: { sku: { in: skus } },
+      select: { sku: true, name: true, product: { select: { name: true } } },
+    }),
+  ]);
+  if (products[0]) throw ApiError.conflict(`SKU ${products[0].sku} is already used by the product "${products[0].name}"`);
+  if (variants[0]) {
+    const v = variants[0];
+    throw ApiError.conflict(`SKU ${v.sku} is already used by "${v.product.name} (${v.name})"`);
+  }
+}
+
+function variantFields(v: VariantInput, sortOrder: number) {
+  return {
+    name: v.name.trim(),
+    sku: v.sku.trim(),
+    priceUsd: v.priceUsd,
+    weightKg: v.weightKg ?? null,
+    images: v.images ?? [],
+    sortOrder,
+  };
+}
+
+function stockFields(v: VariantInput) {
+  return {
+    quantityOnHand: v.initialStock,
+    lowStockThreshold: v.lowStockThreshold ?? DEFAULT_LOW_STOCK_THRESHOLD,
+  };
+}
+
+/**
+ * Bulk-insert rows for a new product's variations and their stock: ids are
+ * generated here so both tables can be written with one createMany each.
+ */
+export function variantBulkData(productId: string, variants: VariantInput[]) {
+  const rows = variants.map((v, i) => ({ id: randomUUID(), v, sortOrder: i }));
+  return {
+    variants: rows.map(({ id, v, sortOrder }) => ({ id, productId, ...variantFields(v, sortOrder) })),
+    stock: rows.map(({ id, v }) => ({ variantId: id, ...stockFields(v) })),
+  };
+}
+
 // Names unique within the product, SKUs unique within the batch — checked
 // up front so a create-with-variants fails with a clear message rather than
 // half-way through on a constraint.
@@ -67,21 +120,7 @@ export function createVariantRows(db: Db, productId: string, variants: VariantIn
   return Promise.all(
     variants.map((v, i) =>
       db.productVariant.create({
-        data: {
-          productId,
-          name: v.name.trim(),
-          sku: v.sku.trim(),
-          priceUsd: v.priceUsd,
-          weightKg: v.weightKg ?? null,
-          images: v.images ?? [],
-          sortOrder: firstSortOrder + i,
-          stockLevel: {
-            create: {
-              quantityOnHand: v.initialStock,
-              lowStockThreshold: v.lowStockThreshold ?? DEFAULT_LOW_STOCK_THRESHOLD,
-            },
-          },
-        },
+        data: { ...variantFields(v, firstSortOrder + i), productId, stockLevel: { create: stockFields(v) } },
         include: { stockLevel: true },
       })
     )
@@ -131,7 +170,7 @@ export async function createVariant(productId: string, input: VariantInput) {
     const [variant] = await createVariantRows(tx, productId, [input], (last?.sortOrder ?? -1) + 1);
     await recomputeProductPrice(tx, productId);
     return variant;
-  });
+  }, TX_OPTIONS);
 }
 
 export async function updateVariant(
@@ -171,7 +210,7 @@ export async function updateVariant(
     }
     await recomputeProductPrice(tx, productId);
     return tx.productVariant.findUniqueOrThrow({ where: { id: variantId }, include: { stockLevel: true } });
-  });
+  }, TX_OPTIONS);
 }
 
 // Like products, a variation with order history can be deleted: its order
@@ -181,7 +220,7 @@ export async function deleteVariant(productId: string, variantId: string) {
     await getVariantOf(tx, productId, variantId);
     await tx.productVariant.delete({ where: { id: variantId } });
     await recomputeProductPrice(tx, productId);
-  });
+  }, TX_OPTIONS);
 }
 
 // Conditional update, so concurrent adjustments can't take stock below 0.

@@ -1,5 +1,5 @@
-import { createHmac } from "crypto";
-import type { StockLevel } from "@prisma/client";
+import { createHmac, randomUUID } from "crypto";
+import { Prisma, type StockLevel } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { env } from "@/config/env";
 import { ApiError } from "@/utils/ApiError";
@@ -9,8 +9,8 @@ import {
   VariantInput,
   applyStockDelta,
   assertDistinctVariants,
-  assertSkuFree,
-  createVariantRows,
+  assertSkusFree,
+  variantBulkData,
   variantsInclude,
 } from "./variants";
 import { withOfferPrices } from "./offers";
@@ -245,10 +245,17 @@ export async function createProduct(input: {
   assertDeliveryEstimate(input);
   const variants = input.variants ?? [];
 
-  return prisma.$transaction(async (tx) => {
-    assertDistinctVariants(variants, input.sku);
-    for (const sku of [input.sku, ...variants.map((v) => v.sku)]) await assertSkuFree(tx, sku);
+  assertDistinctVariants(variants, input.sku);
+  await assertSkusFree(prisma, [input.sku, ...variants.map((v) => v.sku.trim())]);
 
+  // Three statements in one batch transaction — the product, then every
+  // variation, then every stock row — however many variations there are.
+  // (This used to be an interactive transaction with a round trip per
+  // variation, which ran past Prisma's 5s limit for products with several
+  // variations — P2028.) A SKU taken by a concurrent request between the
+  // check above and this write still fails on the unique index, reported as
+  // the same conflict.
+  try {
     const base = {
       categoryId: input.categoryId,
       name: input.name,
@@ -261,7 +268,7 @@ export async function createProduct(input: {
     };
 
     if (variants.length === 0) {
-      return tx.product.create({
+      return await prisma.product.create({
         data: {
           ...base,
           priceUsd: input.priceUsd!,
@@ -277,15 +284,25 @@ export async function createProduct(input: {
       });
     }
 
-    const product = await tx.product.create({
-      data: { ...base, priceUsd: Math.min(...variants.map((v) => v.priceUsd)), weightKg: null },
-    });
-    await createVariantRows(tx, product.id, variants);
-    return tx.product.findUniqueOrThrow({
-      where: { id: product.id },
+    const productId = randomUUID();
+    const rows = variantBulkData(productId, variants);
+    await prisma.$transaction([
+      prisma.product.create({
+        data: { ...base, id: productId, priceUsd: Math.min(...variants.map((v) => v.priceUsd)), weightKg: null },
+      }),
+      prisma.productVariant.createMany({ data: rows.variants }),
+      prisma.stockLevel.createMany({ data: rows.stock }),
+    ]);
+    return await prisma.product.findUniqueOrThrow({
+      where: { id: productId },
       include: { stockLevel: true, ...variantsInclude(true) },
     });
-  });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      throw ApiError.conflict("One of these SKUs was just taken by another product — please use a different SKU");
+    }
+    throw err;
+  }
 }
 
 export async function updateProduct(
