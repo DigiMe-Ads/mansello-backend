@@ -34,6 +34,8 @@ const STATIC_PATH_PATTERNS: RegExp[] = [
   /^\/sri-lanka\/marketplace$/,
   /^\/sri-lanka\/marketplace\/cart$/,
   /^\/sri-lanka\/marketplace\/checkout$/,
+  // Product pages: the id is a public catalog id (not a customer's), safe to record.
+  /^\/sri-lanka\/marketplace\/product\/[0-9a-f-]{36}$/,
 ];
 
 // Explicitly named in BACKEND_CHANGES_SEO_SECURITY_HARDENING.md §1.3 as the

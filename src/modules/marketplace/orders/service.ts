@@ -7,6 +7,8 @@ import { createCheckout, lkrCharge, toCents } from "@/modules/payments/paymentsL
 import { startLkRefund } from "@/modules/payments/lkRefunds";
 import { env } from "@/config/env";
 import { bestOffer, discounted, runningOffers } from "@/modules/marketplace/catalog/offers";
+import { createInvoice, type IpnPayload } from "@/modules/payments/nowPayments";
+import { flagCryptoPayment, recordManualCryptoRefund } from "@/modules/bookings/service";
 
 // The marketplace rides on the Sri Lanka Stripe account — see orders/controller.ts.
 const MARKETPLACE_STRIPE_ACCOUNT = "sri_lanka" as const;
@@ -268,6 +270,10 @@ async function fulfilPaidOrder(orderId: string): Promise<PaidOrderOutcome> {
   }
 
   await prisma.order.updateMany({ where: { id: order.id, status: "pending" }, data: { status: "cancelled" } });
+  if (order.paymentProvider === "nowpayments") {
+    await recordManualCryptoRefund("order", order.id, Number(order.total), "usd", "out of stock when the payment arrived");
+    return "refunded";
+  }
   if (order.paymentProvider === "payments_lk") {
     // Requested now; retried daily until the payment has settled.
     await startLkRefund("order", order.id, "Out of stock when the payment arrived");
@@ -366,7 +372,13 @@ export async function updateOrderStatus(orderId: string, nextStatus: string) {
   // - a paid order being cancelled/returned → full refund, outcome recorded
   //   on the order (refunded once only — idempotency key per order).
   // Branches on the provider stored on the order, not the current switch.
-  if (order.paymentProvider === "payments_lk" && ["cancelled", "returned"].includes(nextStatus)) {
+  if (order.paymentProvider === "nowpayments" && ["cancelled", "returned"].includes(nextStatus)) {
+    // Crypto can't be refunded automatically: record it and tell the admin.
+    if (order.status !== "pending" && order.nowPaymentsPaymentId) {
+      await recordManualCryptoRefund("order", orderId, Number(order.total), "usd", `order ${nextStatus}`);
+      return prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: { items: true } });
+    }
+  } else if (order.paymentProvider === "payments_lk" && ["cancelled", "returned"].includes(nextStatus)) {
     // A pending checkout can't be cancelled at Payments.lk (a late payment is
     // refunded by the webhook backstop); a paid order is refunded in full,
     // settled by the refund webhook.
@@ -423,3 +435,57 @@ export async function expireStalePendingOrders(olderThanHours = 24) {
   }
   return result.count;
 }
+
+// --- NOWPayments (crypto) ------------------------------------------------------
+
+// "Pay with crypto instead" at checkout: a pending order gets a NOWPayments
+// invoice for its USD total; its Stripe PaymentIntent is cancelled so it
+// can't also be paid by card.
+export async function startCryptoCheckout(orderId: string) {
+  const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: true } });
+  if (!order) throw ApiError.notFound("Order not found");
+  if (order.status !== "pending") throw ApiError.badRequest("This order is no longer waiting for payment.");
+
+  const units = order.items.reduce((n, i) => n + i.quantity, 0);
+  const invoice = await createInvoice({
+    kind: "order",
+    id: orderId,
+    amount: Number(order.total),
+    currency: "usd",
+    description: `Mansello marketplace order, ${units} item${units === 1 ? "" : "s"}`,
+    successUrl: `${env.publicSiteUrl}/sri-lanka/marketplace/order/${orderId}`,
+  });
+  if (order.stripePaymentIntentId) {
+    await cancelPaymentIntentQuietly(MARKETPLACE_STRIPE_ACCOUNT, order.stripePaymentIntentId);
+  }
+  const updated = await prisma.order.update({
+    where: { id: orderId },
+    data: { paymentProvider: "nowpayments", nowPaymentsInvoiceId: invoice.id, chargeAmount: null, chargeCurrency: null, fxRate: null },
+    include: { items: true },
+  });
+  return { order: updated, checkoutUrl: invoice.invoice_url };
+}
+
+// IPN "finished" for an order (amount already checked by the webhook).
+export async function confirmCryptoOrder(orderId: string, ipn: IpnPayload): Promise<PaidOrderOutcome | "duplicate"> {
+  const paymentId = String(ipn.payment_id);
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order) return "nothing_to_do";
+  if (order.nowPaymentsPaymentId === paymentId) return "nothing_to_do"; // repeat delivery
+  if (order.status !== "pending" && order.status !== "cancelled") {
+    await recordManualCryptoRefund("order", orderId, Number(order.total), "usd", `paid twice — crypto payment ${paymentId}`);
+    return "duplicate";
+  }
+  await prisma.order.update({
+    where: { id: orderId },
+    data: {
+      paymentProvider: "nowpayments",
+      nowPaymentsPaymentId: paymentId,
+      cryptoPayCurrency: ipn.pay_currency ?? null,
+      cryptoPayAmount: ipn.actually_paid != null ? String(ipn.actually_paid) : null,
+    },
+  });
+  return fulfilPaidOrder(orderId);
+}
+
+export { flagCryptoPayment };

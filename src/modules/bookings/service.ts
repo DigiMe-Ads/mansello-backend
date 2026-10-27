@@ -6,6 +6,8 @@ import { cancelPaymentIntentQuietly, refundPaymentIntent } from "@/modules/payme
 import { StripeAccountRef } from "@/modules/payments/stripeClients";
 import { createCheckout, lkrCharge, toCents } from "@/modules/payments/paymentsLk";
 import { startLkRefund } from "@/modules/payments/lkRefunds";
+import { createInvoice, type IpnPayload } from "@/modules/payments/nowPayments";
+import { alertAdmin } from "@/modules/notifications/email";
 
 function isExclusionViolation(err: unknown): boolean {
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
@@ -702,6 +704,10 @@ async function handleLatePayment(booking: BookingWithProperty): Promise<LatePaym
   // processor took it.
   const amount = Number(booking.totalPrice);
   const refundReason = "Payment arrived after the hold expired and the dates were no longer available";
+  if (booking.paymentProvider === "nowpayments") {
+    await recordManualCryptoRefund("booking", booking.id, amount, booking.currency, refundReason);
+    return "refunded";
+  }
   if (booking.paymentProvider === "payments_lk") {
     await prisma.booking.update({ where: { id: booking.id }, data: { refundAmount: amount, refundReason } });
     // Requested now; a request made before the payment settles fails and is
@@ -839,7 +845,14 @@ export async function cancelBooking(bookingId: string, refundOverride?: number, 
   // SRI_LANKA_PAYMENT_PROVIDER switch — a Stripe booking made before the
   // cutover still refunds through Stripe.
   const accountRef = booking.property.stripeAccountRef as StripeAccountRef;
-  if (booking.paymentProvider === "payments_lk") {
+  if (booking.paymentProvider === "nowpayments") {
+    // Crypto can't be refunded automatically — record what's owed and tell
+    // the admin. A still-open invoice that gets paid later is caught by the
+    // IPN handler (the booking is no longer pending) and flagged the same way.
+    if (booking.status === "confirmed" && refundAmount > 0) {
+      await recordManualCryptoRefund("booking", bookingId, refundAmount, booking.currency, reason ?? "Booking cancelled");
+    }
+  } else if (booking.paymentProvider === "payments_lk") {
     // A pending checkout can't be cancelled at Payments.lk; if the guest
     // still pays, the late-payment backstop refunds it. A paid booking's
     // refund is requested here and settled by the refund webhook.
@@ -868,4 +881,142 @@ export async function cancelBooking(bookingId: string, refundOverride?: number, 
   }
 
   return prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+}
+
+// --- NOWPayments (crypto, both sites) ----------------------------------------
+// See modules/payments/nowPayments.ts.
+
+// Crypto payments take longer than a card (network confirmations), so the
+// hold is extended when the guest switches to crypto, and again while
+// NOWPayments reports the payment as in flight.
+export const CRYPTO_HOLD_MINUTES = 60;
+
+function sitePath(stripeAccountRef: string) {
+  return stripeAccountRef === "italy" ? "italy" : "sri-lanka";
+}
+
+// "Pay with crypto instead" on the payment step: a pending booking (already
+// holding its dates) gets a NOWPayments invoice in its own currency. Its
+// Stripe PaymentIntent is cancelled so it can't also be paid by card; a
+// Payments.lk checkout can't be cancelled, so its charge is cleared and a
+// payment through it no longer matches (flagged for the admin instead).
+export async function startCryptoCheckout(bookingId: string) {
+  const booking = await prisma.booking.findUnique({ where: { id: bookingId }, include: { property: true } });
+  if (!booking) throw ApiError.notFound("Booking not found");
+  if (booking.status !== "pending_payment") {
+    throw ApiError.badRequest("This booking is no longer waiting for payment — please start a new booking.");
+  }
+  if (booking.expiresAt && booking.expiresAt < new Date()) {
+    throw ApiError.badRequest("Your hold expired before payment was completed. Please start again.");
+  }
+
+  const nights = Math.round((booking.checkOut.getTime() - booking.checkIn.getTime()) / MS_PER_DAY);
+  const invoice = await createInvoice({
+    kind: "booking",
+    id: bookingId,
+    amount: Number(booking.totalPrice),
+    currency: booking.currency,
+    description: `${booking.property.name}, ${booking.checkIn.toISOString().slice(0, 10)} to ${booking.checkOut
+      .toISOString()
+      .slice(0, 10)} (${nights} night${nights === 1 ? "" : "s"})`,
+    successUrl: `${env.publicSiteUrl}/${sitePath(booking.property.stripeAccountRef)}/booking/confirmation?bookingId=${bookingId}`,
+  });
+
+  if (booking.stripePaymentIntentId) {
+    await cancelPaymentIntentQuietly(booking.property.stripeAccountRef as StripeAccountRef, booking.stripePaymentIntentId);
+  }
+  const updated = await prisma.booking.update({
+    where: { id: bookingId },
+    data: {
+      paymentProvider: "nowpayments",
+      nowPaymentsInvoiceId: invoice.id,
+      chargeAmount: null,
+      chargeCurrency: null,
+      fxRate: null,
+      expiresAt: new Date(Date.now() + CRYPTO_HOLD_MINUTES * 60_000),
+    },
+  });
+  return { booking: updated, checkoutUrl: invoice.invoice_url };
+}
+
+// The payment is on its way (confirming on the blockchain) — keep the dates
+// held so a slow confirmation doesn't release them.
+export async function extendCryptoHold(bookingId: string) {
+  await prisma.booking.updateMany({
+    where: { id: bookingId, status: "pending_payment", paymentProvider: "nowpayments" },
+    data: { expiresAt: new Date(Date.now() + CRYPTO_HOLD_MINUTES * 60_000) },
+  });
+}
+
+async function addPaymentNote(kind: "booking" | "order", id: string, note: string) {
+  const current =
+    kind === "booking"
+      ? await prisma.booking.findUnique({ where: { id }, select: { paymentNote: true } })
+      : await prisma.order.findUnique({ where: { id }, select: { paymentNote: true } });
+  if (current?.paymentNote?.includes(note)) return false;
+  const paymentNote = current?.paymentNote ? `${current.paymentNote}\n${note}` : note;
+  if (kind === "booking") await prisma.booking.update({ where: { id }, data: { paymentNote } });
+  else await prisma.order.update({ where: { id }, data: { paymentNote } });
+  return true;
+}
+
+/** Records a crypto refund the admin has to send by hand, and emails them. */
+export async function recordManualCryptoRefund(
+  kind: "booking" | "order",
+  id: string,
+  amount: number,
+  currency: string,
+  reason: string
+) {
+  const note = `Refund ${amount.toFixed(2)} ${currency.toUpperCase()} in crypto by hand (${reason}) — ask the customer for a wallet address, then mark it done.`;
+  if (kind === "booking") {
+    await prisma.booking.update({ where: { id }, data: { refundAmount: amount, refundReason: reason, refundStatus: "manual" } });
+  } else {
+    await prisma.order.update({ where: { id }, data: { refundStatus: "manual" } });
+  }
+  if (await addPaymentNote(kind, id, note)) await alertAdmin(`Crypto refund needed (${kind} ${id})`, [note]);
+}
+
+/** Something about a crypto payment the admin must look at; never confirms anything. */
+export async function flagCryptoPayment(kind: "booking" | "order", id: string, note: string) {
+  if (await addPaymentNote(kind, id, note)) await alertAdmin(`Crypto payment needs attention (${kind} ${id})`, [note]);
+}
+
+// IPN "finished" for a booking: the amount has already been checked against
+// the booking by the webhook. Confirms a pending booking; reinstates or
+// refunds (by hand) a lapsed one; flags a second payment for one that was
+// already paid. Safe to run twice.
+export async function confirmCryptoBooking(
+  bookingId: string,
+  ipn: IpnPayload
+): Promise<"confirmed" | LatePaymentOutcome | "duplicate"> {
+  const paymentId = String(ipn.payment_id);
+  const booking = await getBooking(bookingId);
+  if (!booking) return "nothing_to_do";
+  if (booking.nowPaymentsPaymentId === paymentId) return "nothing_to_do"; // repeat delivery
+
+  if (booking.paymentProvider !== "nowpayments" || (booking.nowPaymentsPaymentId && booking.status === "confirmed")) {
+    // Paid another way (or twice) already — keep it, flag the extra money.
+    if (booking.status === "confirmed" || booking.status === "paid_offline" || booking.status === "completed") {
+      await recordManualCryptoRefund("booking", bookingId, Number(booking.totalPrice), booking.currency, `paid twice — crypto payment ${paymentId}`);
+      return "duplicate";
+    }
+  }
+
+  await prisma.booking.update({
+    where: { id: bookingId },
+    data: {
+      paymentProvider: "nowpayments",
+      nowPaymentsPaymentId: paymentId,
+      cryptoPayCurrency: ipn.pay_currency ?? null,
+      cryptoPayAmount: ipn.actually_paid != null ? String(ipn.actually_paid) : null,
+    },
+  });
+  const confirmed = await prisma.booking.updateMany({
+    where: { id: bookingId, status: "pending_payment" },
+    data: { status: "confirmed", expiresAt: null },
+  });
+  if (confirmed.count === 1) return "confirmed";
+  const fresh = await getBooking(bookingId);
+  return fresh ? handleLatePayment(fresh) : "nothing_to_do";
 }

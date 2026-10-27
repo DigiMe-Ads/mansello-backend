@@ -11,6 +11,11 @@ import icalExportRoutes from "@/modules/availability/icalExport";
 import bookingsRoutes from "@/modules/bookings/routes";
 import { italyWebhookRouter, sriLankaWebhookRouter } from "@/modules/payments/webhooks";
 import { paymentsLkWebhookRouter, paymentsLkReturnRouter } from "@/modules/payments/paymentsLkRoutes";
+import {
+  nowPaymentsReturnRouter,
+  nowPaymentsWebhookRouter,
+  paymentMethodsRouter,
+} from "@/modules/payments/nowPaymentsRoutes";
 import catalogRoutes from "@/modules/marketplace/catalog/routes";
 import ordersRoutes from "@/modules/marketplace/orders/routes";
 import shippingRatesRoutes from "@/modules/marketplace/shipping/routes";
@@ -51,6 +56,7 @@ export function createApp() {
       .replace(/^\/ical\/[^/?]+\.ics/, "/ical/***.ics")
       .replace(/^\/api\/booking-info-requests\/[^/?]+/, "/api/booking-info-requests/***")
       .replace(/^(\/api\/payments-lk\/return\/cancel)\?.*/, "$1?***")
+      .replace(/^(\/api\/nowpayments\/return\/cancel)\?.*/, "$1?***")
   );
   app.use(morgan(env.nodeEnv === "development" ? "dev" : "combined"));
 
@@ -100,6 +106,11 @@ export function createApp() {
   app.use("/api/content", contentPublicRoutes);
   app.use("/api/admin/content", contentAdminRoutes);
   app.use("/api/payments-lk/return", paymentsLkReturnRouter);
+  // NOWPayments (crypto, both sites). The IPN signature is over the parsed
+  // JSON with sorted keys, so it sits after express.json().
+  app.use("/api/webhooks/nowpayments", nowPaymentsWebhookRouter);
+  app.use("/api/nowpayments/return", nowPaymentsReturnRouter);
+  app.use("/api/payments", paymentMethodsRouter);
 
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);

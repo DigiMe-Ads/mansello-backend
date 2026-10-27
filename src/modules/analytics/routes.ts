@@ -34,6 +34,12 @@ router.get(
   asyncHandler(controller.getHeatmapData)
 );
 router.get(
+  "/countries",
+  requireAuth,
+  requireRole("super_admin"),
+  asyncHandler(controller.getCountryReach)
+);
+router.get(
   "/heatmap/pages",
   requireAuth,
   requireRole("super_admin"),

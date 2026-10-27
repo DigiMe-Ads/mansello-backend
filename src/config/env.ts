@@ -74,6 +74,13 @@ export const env = {
   // BACKEND_CHANGES_VARIANTS_CALENDAR_PAYMENTS_LK.md §3. The live key wins
   // when present, so going live is just adding PAYMENTS_LK_SECRET_KEY.
   // Never log these.
+  // NOWPayments (crypto, both sites) — API key and IPN secret from the
+  // NOWPayments dashboard. Crypto is offered only when both are set.
+  // Never log these.
+  nowPayments: {
+    apiKey: process.env.NOW_PAYMENTS_API ?? "",
+    ipnSecret: process.env.NOW_PAYMENTS_IPN ?? "",
+  },
   paymentsLk: {
     secretKey: process.env.PAYMENTS_LK_SECRET_KEY || process.env.PAYMENTS_LK_SANDBOX || "",
     webhookSecret: process.env.PAYMENTS_LK_WEBHOOK_SECRET ?? "",

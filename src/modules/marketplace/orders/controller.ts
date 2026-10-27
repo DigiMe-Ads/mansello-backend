@@ -52,6 +52,13 @@ export async function createOrder(req: Request, res: Response) {
   res.status(201).json({ order, clientSecret: intent.client_secret });
 }
 
+// Switches a pending order to a NOWPayments crypto invoice; the frontend
+// redirects to checkoutUrl.
+export async function startCryptoCheckout(req: Request, res: Response) {
+  const { order, checkoutUrl } = await service.startCryptoCheckout(req.params.id);
+  res.json({ order: { id: order.id, status: order.status }, checkoutUrl });
+}
+
 export async function listOrders(req: Request, res: Response) {
   res.json(await service.listOrders(req.query.status as string | undefined));
 }

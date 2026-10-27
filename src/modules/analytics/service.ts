@@ -1,3 +1,4 @@
+import { getTimezone } from "countries-and-timezones";
 import { prisma } from "@/db/prisma";
 import { isAllowedHeatmapPath } from "./pageAllowlist";
 
@@ -17,7 +18,18 @@ interface SanitizedClickEvent {
   device: ClickDevice;
   sessionId: string;
   targetSelector: string | null;
+  country: string | null;
   occurredAt: Date;
+}
+
+// The visitor's device timezone → the country it belongs to. Approximate by
+// nature (a traveller whose phone stays on home time counts as home), but
+// needs no IP address and no IP database. Zones shared by several countries
+// count as the first one listed; UTC/"Etc/…" zones count as unknown.
+function countryForTimeZone(timeZone: unknown): string | null {
+  if (typeof timeZone !== "string" || timeZone.length > 64) return null;
+  const countries = getTimezone(timeZone)?.countries ?? [];
+  return countries[0] ?? null;
 }
 
 // Deliberately lenient, not the usual zod `validate()` middleware — this is
@@ -62,6 +74,7 @@ function sanitizeEvent(raw: unknown): SanitizedClickEvent | null {
     device: e.device as ClickDevice,
     sessionId: e.sessionId.slice(0, 128),
     targetSelector,
+    country: countryForTimeZone(e.timeZone),
     occurredAt,
   };
 }
@@ -185,4 +198,41 @@ export async function deleteStaleClickEvents(retentionDays = 180): Promise<numbe
   const cutoff = new Date(Date.now() - retentionDays * MS_PER_DAY);
   const result = await prisma.clickEvent.deleteMany({ where: { occurredAt: { lt: cutoff } } });
   return result.count;
+}
+
+// --- Country reach ---------------------------------------------------------
+// Visitors (distinct click sessions) and clicks per country for a site and
+// date range. Only covers visits that clicked something (the tracker records
+// clicks, not page loads) and only since countries started being recorded.
+
+export interface CountryReachRow {
+  country: string | null;
+  visitors: number;
+  clicks: number;
+}
+
+export async function getCountryReach(query: { site?: "italy" | "sri_lanka"; from: Date; toExclusive: Date }) {
+  const rows = query.site
+    ? await prisma.$queryRaw<{ country: string | null; visitors: bigint; clicks: bigint }[]>`
+        SELECT country, COUNT(DISTINCT "sessionId") AS visitors, COUNT(*) AS clicks
+        FROM "ClickEvent"
+        WHERE "occurredAt" >= ${query.from} AND "occurredAt" < ${query.toExclusive}
+          AND site = ${query.site}::"Site"
+        GROUP BY country
+        ORDER BY visitors DESC`
+    : await prisma.$queryRaw<{ country: string | null; visitors: bigint; clicks: bigint }[]>`
+        SELECT country, COUNT(DISTINCT "sessionId") AS visitors, COUNT(*) AS clicks
+        FROM "ClickEvent"
+        WHERE "occurredAt" >= ${query.from} AND "occurredAt" < ${query.toExclusive}
+        GROUP BY country
+        ORDER BY visitors DESC`;
+  const since = await prisma.clickEvent.findFirst({
+    where: { country: { not: null } },
+    orderBy: { occurredAt: "asc" },
+    select: { occurredAt: true },
+  });
+  return {
+    countries: rows.map((r) => ({ country: r.country, visitors: Number(r.visitors), clicks: Number(r.clicks) })),
+    trackingSince: since?.occurredAt ?? null,
+  };
 }

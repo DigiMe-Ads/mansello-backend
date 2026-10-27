@@ -13,6 +13,8 @@ const router = Router();
 // script could keep the whole calendar held (BACKEND_SECURITY_AUDIT.md H4).
 router.post("/", bookingLimiter, validate(startBookingSchema), asyncHandler(controller.startBooking));
 router.get("/:id", asyncHandler(controller.getBooking));
+// Public — "Pay with crypto instead" on the payment step (NOWPayments).
+router.post("/:id/crypto-checkout", bookingLimiter, asyncHandler(controller.startCryptoCheckout));
 
 // Admin.
 router.get(

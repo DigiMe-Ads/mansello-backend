@@ -11,6 +11,8 @@ const router = Router();
 // Public — guest checkout.
 router.post("/", publicFormLimiter, validate(createOrderSchema), asyncHandler(controller.createOrder));
 router.get("/:id", asyncHandler(controller.getOrder));
+// Public — "Pay with crypto instead" at checkout (NOWPayments).
+router.post("/:id/crypto-checkout", publicFormLimiter, asyncHandler(controller.startCryptoCheckout));
 
 // Admin.
 const manager = [requireAuth, requireRole("super_admin", "marketplace_manager")] as const;

@@ -60,6 +60,14 @@ export async function startBooking(req: Request, res: Response) {
   res.status(201).json({ booking, clientSecret: intent.client_secret });
 }
 
+// Switches a pending booking to a NOWPayments crypto invoice; the frontend
+// redirects to checkoutUrl. Anyone holding the (unguessable) booking id can
+// do this — it only changes how the guest's own hold gets paid.
+export async function startCryptoCheckout(req: Request, res: Response) {
+  const { booking, checkoutUrl } = await bookingService.startCryptoCheckout(req.params.id);
+  res.json({ booking: { id: booking.id, status: booking.status, expiresAt: booking.expiresAt }, checkoutUrl });
+}
+
 export async function createOfflineBooking(req: Request, res: Response) {
   const booking = await bookingService.createOfflineBooking({
     propertyId: req.body.propertyId,

@@ -337,6 +337,11 @@ model Booking {
   refundAttempts        Int           @default(0) // Payments.lk refund requests made so far (a refund asked before the payment settles fails, and is retried)
   refundedChargeAmount  Decimal?      @db.Decimal(12, 2) // total refunded so far per Payments.lk, in chargeCurrency — includes refunds made outside this backend
   paymentNote           String? // something an admin should look at, e.g. a refund made from the Payments.lk dashboard
+  // NOWPayments (crypto) — see modules/payments/nowPayments.ts.
+  nowPaymentsInvoiceId  String?       @unique // latest invoice opened for it
+  nowPaymentsPaymentId  String? // the payment that paid it
+  cryptoPayCurrency     String? // coin the customer paid in, e.g. "usdttrc20"
+  cryptoPayAmount       String? // amount of that coin actually received (string: crypto precision)
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
 
@@ -566,6 +571,11 @@ model Order {
   refundAttempts        Int         @default(0) // Payments.lk refund requests made so far (a refund asked before the payment settles fails, and is retried)
   refundedChargeAmount  Decimal?    @db.Decimal(12, 2) // total refunded so far per Payments.lk, in chargeCurrency — includes refunds made outside this backend
   paymentNote           String? // something an admin should look at, e.g. a refund made from the Payments.lk dashboard
+  // NOWPayments (crypto) — see modules/payments/nowPayments.ts.
+  nowPaymentsInvoiceId  String?       @unique // latest invoice opened for it
+  nowPaymentsPaymentId  String? // the payment that paid it
+  cryptoPayCurrency     String? // coin the customer paid in, e.g. "usdttrc20"
+  cryptoPayAmount       String? // amount of that coin actually received (string: crypto precision)
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
@@ -718,10 +728,15 @@ model ClickEvent {
   device         ClickDevice // coarse bucket computed client-side from window.innerWidth, matches the admin preview iframe's virtual widths
   sessionId      String // random UUID in sessionStorage — resets every tab/session, exists only to count distinct "page views" apart from raw click volume
   targetSelector String? // best-effort "tag#id.class" — informational only
+  // ISO 3166 alpha-2, worked out server-side from the visitor's device
+  // timezone (e.g. "Asia/Colombo" → "LK") — no IP address is used or stored.
+  // Null for events recorded before this existed, or an unmappable zone.
+  country        String?     @db.VarChar(2)
   occurredAt     DateTime // client-reported click time
   createdAt      DateTime    @default(now()) // server receive time
 
   @@index([path, device, occurredAt])
+  @@index([occurredAt, country])
 }
 
 // Admin-manageable reviews for the "Our Client Says!" carousels — scoped to

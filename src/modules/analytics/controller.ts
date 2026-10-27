@@ -77,6 +77,19 @@ export async function getHeatmapData(req: Request, res: Response) {
   });
 }
 
+export async function getCountryReach(req: Request, res: Response) {
+  const { site, from: fromParam, to: toParam } = req.query as { site?: string; from?: string; to?: string };
+  if (site !== undefined && site !== "italy" && site !== "sri_lanka") {
+    throw ApiError.badRequest('site must be "italy" or "sri_lanka"');
+  }
+  const from = fromParam ? new Date(fromParam) : new Date(0);
+  const toExclusive = toParam ? new Date(new Date(toParam).getTime() + 24 * 60 * 60 * 1000) : new Date();
+  if (Number.isNaN(from.getTime()) || Number.isNaN(toExclusive.getTime())) {
+    throw ApiError.badRequest("from/to must be dates (YYYY-MM-DD)");
+  }
+  res.json(await service.getCountryReach({ site, from, toExclusive }));
+}
+
 export async function listHeatmapPages(req: Request, res: Response) {
   const { site } = req.query as { site?: string };
   if (site !== undefined && site !== "italy" && site !== "sri_lanka") {
