@@ -35,6 +35,7 @@ import analyticsRoutes from "@/modules/analytics/routes";
 import testimonialsRoutes from "@/modules/testimonials/routes";
 import { propertyTransportRatesRoutes, adminTransportRatesRoutes } from "@/modules/transportRates/routes";
 import { publicRoutes as contentPublicRoutes, adminRoutes as contentAdminRoutes } from "@/modules/content/routes";
+import { publicRoutes as guidePublicRoutes, adminRoutes as guideAdminRoutes } from "@/modules/guides/routes";
 
 export function createApp() {
   const app = express();
@@ -105,6 +106,8 @@ export function createApp() {
   app.use("/api/admin/properties", adminTransportRatesRoutes);
   app.use("/api/content", contentPublicRoutes);
   app.use("/api/admin/content", contentAdminRoutes);
+  app.use("/api/guides", guidePublicRoutes);
+  app.use("/api/admin/guides", guideAdminRoutes);
   app.use("/api/payments-lk/return", paymentsLkReturnRouter);
   // NOWPayments (crypto, both sites). The IPN signature is over the parsed
   // JSON with sorted keys, so it sits after express.json().

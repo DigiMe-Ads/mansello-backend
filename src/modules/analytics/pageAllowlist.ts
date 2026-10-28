@@ -21,7 +21,7 @@
 const STATIC_PATH_PATTERNS: RegExp[] = [
   /^\/$/,
   /^\/(italy|sri-lanka)$/,
-  /^\/(italy|sri-lanka)\/(about|contact|airbnb|privacy|terms)$/,
+  /^\/(italy|sri-lanka)\/(about|contact|guide|airbnb|privacy|terms)$/,
   /^\/sri-lanka\/refund-policy$/,
   /^\/sri-lanka\/transport$/,
   // Destination pages and tour packages are static, bundled-at-build-time

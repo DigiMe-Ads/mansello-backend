@@ -775,3 +775,15 @@ model SiteContent {
   updatedById String?
   updatedBy   AdminUser? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
 }
+
+// The guest guide ("Your 2-Day Bologna Itinerary" and its Sri Lanka
+// counterpart) shown on each site's contact page and at /{site}/guide — the
+// page the printed QR code opens. One row per site holding the whole guide
+// as JSON, shape-checked by modules/guides/validation.ts. No row = the
+// frontend's built-in default guide (same convention as SiteContent).
+model Guide {
+  site        Site     @id
+  content     Json
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+}
